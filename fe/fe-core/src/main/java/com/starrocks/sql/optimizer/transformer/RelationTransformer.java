@@ -1272,6 +1272,7 @@ public class RelationTransformer implements AstVisitorExtendInterface<LogicalPla
         return new LogicalPlan(builder, output, List.of());
     }
 
+
     private ScalarOperator buildJoinUsingPredicate(JoinRelation node, LogicalPlan leftPlan, LogicalPlan rightPlan) {
         List<String> usingColumns = node.getUsingColNames();
         List<ScalarOperator> predicates = new ArrayList<>();

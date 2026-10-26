@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+
 package com.starrocks.sql.optimizer;
 
 import com.google.common.collect.ImmutableList;
@@ -28,6 +29,7 @@ import com.starrocks.sql.optimizer.operator.logical.LogicalAssertOneRowOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalFilterOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalJoinOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalLimitOperator;
+import com.starrocks.sql.optimizer.operator.logical.LogicalPaimonScanOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalProjectOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalRawValuesOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalScanOperator;
@@ -47,6 +49,7 @@ import com.starrocks.sql.optimizer.operator.physical.PhysicalJoinOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalMetaScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalMysqlScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalOlapScanOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalPaimonScanOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalRawValuesOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalRepeatOperator;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalScanOperator;
@@ -86,6 +89,7 @@ public class LogicalPlanPrinter {
         OperatorStr optStrings = new OperatorPrinter(isPrintTableName, isPrintColumnRef).visit(root);
         return optStrings.toString();
     }
+
 
     private static class OperatorStr {
         private final String operatorString;
@@ -230,13 +234,20 @@ public class LogicalPlanPrinter {
 
         @Override
         public OperatorStr visitLogicalTableScan(OptExpression optExpression, Integer step) {
-            if (!isPrintColumnRef) {
-                return new OperatorStr("logical scan", step, Collections.emptyList());
-            }
             LogicalScanOperator scanOperator = optExpression.getOp().cast();
+            String suffix = "";
+            if (scanOperator instanceof LogicalPaimonScanOperator) {
+                LogicalPaimonScanOperator paimonScan = (LogicalPaimonScanOperator) scanOperator;
+                if (paimonScan.getIndexCondition() != null) {
+                    suffix = " index[" + paimonScan.getIndexCondition() + "]";
+                }
+            }
+            if (!isPrintColumnRef) {
+                return new OperatorStr("logical scan" + suffix, step, Collections.emptyList());
+            }
             return new OperatorStr("logical scan(" +
                     scanOperator.getColRefToColumnMetaMap().keySet().stream().map(col -> "" + col).collect(
-                            Collectors.joining(", ")) + ")", step, Collections.emptyList());
+                            Collectors.joining(", ")) + ")" + suffix, step, Collections.emptyList());
         }
 
         @Override
@@ -511,7 +522,9 @@ public class LogicalPlanPrinter {
 
         @Override
         public OperatorStr visitPhysicalPaimonScan(OptExpression optExpression, Integer step) {
-            return visitScanCommon(optExpression, step, "PAIMON SCAN");
+            PhysicalPaimonScanOperator scan = optExpression.getOp().cast();
+            String suffix = scan.getIndexCondition() == null ? "" : " index[" + scan.getIndexCondition() + "]";
+            return visitScanCommon(optExpression, step, "PAIMON SCAN", suffix);
         }
 
         @Override

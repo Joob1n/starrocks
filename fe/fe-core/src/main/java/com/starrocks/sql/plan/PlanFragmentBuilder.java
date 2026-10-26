@@ -1828,7 +1828,8 @@ public class PlanFragmentBuilder {
                     paimonScanNode.getConjuncts()
                             .add(ScalarOperatorToExpr.buildExecExpression(predicate, formatterContext));
                 }
-                paimonScanNode.setupScanRangeLocations(tupleDescriptor, node.getPredicate(), node.getLimit());
+                paimonScanNode.setupScanRangeLocations(
+                        tupleDescriptor, node.getPredicate(), node.getLimit(), node.getIndexCondition());
                 HDFSScanNodePredicates scanNodePredicates = paimonScanNode.getScanNodePredicates();
                 prepareCommonExpr(scanNodePredicates, node.getScanOperatorPredicates(), context);
                 prepareMinMaxExpr(scanNodePredicates, node.getScanOperatorPredicates(), context, referenceTable);
