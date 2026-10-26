@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer;
 
 import com.google.common.collect.ImmutableList;
@@ -87,7 +86,6 @@ public class LogicalPlanPrinter {
         OperatorStr optStrings = new OperatorPrinter(isPrintTableName, isPrintColumnRef).visit(root);
         return optStrings.toString();
     }
-
 
     private static class OperatorStr {
         private final String operatorString;
@@ -459,10 +457,15 @@ public class LogicalPlanPrinter {
         }
 
         private OperatorStr visitScanCommon(OptExpression optExpression, Integer step, String scanName) {
+            return visitScanCommon(optExpression, step, scanName, "");
+        }
+
+        private OperatorStr visitScanCommon(OptExpression optExpression, Integer step, String scanName, String suffix) {
             PhysicalScanOperator scan = (PhysicalScanOperator) optExpression.getOp();
             StringBuilder sb = new StringBuilder(scanName + " (");
             sb.append("columns").append(scan.getUsedColumns());
-            sb.append(" predicate[").append(scan.getPredicate()).append("]");
+            sb.append(" predicate[").append(scan.getPredicate()).append("]")
+                    .append(suffix);
             sb.append(")");
             if (scan.getLimit() >= 0) {
                 sb.append(" Limit ").append(scan.getLimit());
@@ -514,6 +517,11 @@ public class LogicalPlanPrinter {
         @Override
         public OperatorStr visitPhysicalFlussScan(OptExpression optExpression, Integer step) {
             return visitScanCommon(optExpression, step, "FLUSS SCAN");
+        }
+
+        @Override
+        public OperatorStr visitPhysicalIndexScan(OptExpression optExpression, Integer step) {
+            return visitScanCommon(optExpression, step, "CONNECTOR INDEX SCAN");
         }
 
         @Override
