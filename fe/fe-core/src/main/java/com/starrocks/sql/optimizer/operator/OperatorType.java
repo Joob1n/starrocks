@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 package com.starrocks.sql.optimizer.operator;
 
 import java.util.Arrays;
@@ -34,6 +33,7 @@ public enum OperatorType {
     LOGICAL_HUDI_SCAN,
     LOGICAL_DELTALAKE_SCAN,
     LOGICAL_PAIMON_SCAN,
+    LOGICAL_INDEX_SCAN,
     LOGICAL_ODPS_SCAN,
     LOGICAL_ICEBERG_METADATA_SCAN,
     LOGICAL_KUDU_SCAN,
@@ -89,6 +89,7 @@ public enum OperatorType {
     PHYSICAL_HUDI_SCAN,
     PHYSICAL_DELTALAKE_SCAN,
     PHYSICAL_PAIMON_SCAN,
+    PHYSICAL_INDEX_SCAN,
     PHYSICAL_FLUSS_SCAN,
     PHYSICAL_ODPS_SCAN,
     PHYSICAL_ICEBERG_METADATA_SCAN,
