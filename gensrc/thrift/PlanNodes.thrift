@@ -1394,6 +1394,7 @@ struct TExceptNode {
     5: optional list<list<Exprs.TExpr>> local_partition_by_exprs
 }
 
+
 struct TExchangeNode {
   // The ExchangeNode's input rows form a prefix of the output rows it produces;
   // this describes the composition of that prefix
