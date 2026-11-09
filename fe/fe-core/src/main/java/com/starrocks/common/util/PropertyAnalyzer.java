@@ -297,6 +297,8 @@ public class PropertyAnalyzer {
 
     public static final String PROPERTIES_ENABLE_STATISTIC_COLLECT_ON_FIRST_LOAD = "enable_statistic_collect_on_first_load";
 
+    public static final String PROPERTIES_ENABLE_STATISTIC_AUTO_COLLECT = "enable_statistic_auto_collect";
+
     // For admin repair cloud native table
     // Enforces consistent version across all tablets in a physical partition
     public static final String PROPERTIES_ENFORCE_CONSISTENT_VERSION = "enforce_consistent_version";
@@ -712,6 +714,17 @@ public class PropertyAnalyzer {
             }
             if (autoRefreshPartitionsLimit <= 0 && autoRefreshPartitionsLimit != INVALID) {
                 throw new SemanticException("Illegal Auto Refresh Partitions Limit: " + autoRefreshPartitionsLimit);
+            }
+            // -1 stays legal on every mode: clearing the property is the only way out for a view that
+            // already carries it.
+            if (autoRefreshPartitionsLimit > 0 && mv.getCurrentRefreshMode().isIncrementalOrAuto()) {
+                throw new SemanticException(
+                        "The auto_refresh_partitions_limit property does not support refresh_mode %s. "
+                                + "It leaves the oldest partitions unrefreshed, while incremental "
+                                + "maintenance requires a complete baseline. Use partition_refresh_number "
+                                + "to batch the initial full refresh instead; refreshes after that process "
+                                + "only the base table changes.",
+                        mv.getCurrentRefreshMode());
             }
             properties.remove(PROPERTIES_AUTO_REFRESH_PARTITIONS_LIMIT);
         }
@@ -2278,6 +2291,14 @@ public class PropertyAnalyzer {
                     PeriodDuration duration = PropertyAnalyzer.analyzeDataCachePartitionDuration(properties);
                     materializedView.setDataCachePartitionDuration(duration);
                 }
+            }
+
+            // file_bundling
+            if (materializedView.isCloudNativeMaterializedView()) {
+                materializedView.setFileBundling(PropertyAnalyzer.analyzeFileBundling(properties));
+            } else if (properties.containsKey(PropertyAnalyzer.PROPERTIES_FILE_BUNDLING)) {
+                throw new AnalysisException(PropertyAnalyzer.PROPERTIES_FILE_BUNDLING
+                        + " is only supported for materialized views in shared-data mode");
             }
 
             // NOTE: for recognizing unknown properties, this should be put as the last if condition

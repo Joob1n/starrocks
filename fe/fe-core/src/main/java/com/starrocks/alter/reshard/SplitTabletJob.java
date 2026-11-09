@@ -44,11 +44,11 @@ import com.starrocks.common.util.TimeUtils;
 import com.starrocks.common.util.concurrent.lock.AutoCloseableLock;
 import com.starrocks.common.util.concurrent.lock.LockType;
 import com.starrocks.lake.LakeTablet;
+import com.starrocks.lake.TxnInfoHelper;
 import com.starrocks.lake.Utils;
 import com.starrocks.lake.compaction.CompactionMgr;
 import com.starrocks.lake.compaction.PartitionIdentifier;
 import com.starrocks.lake.vector.VectorIndexBuildScheduler;
-import com.starrocks.metric.MetricRepo;
 import com.starrocks.proto.ParentTabletPublishInfoPB;
 import com.starrocks.proto.TxnInfoPB;
 import com.starrocks.proto.TxnTypePB;
@@ -106,6 +106,7 @@ public class SplitTabletJob extends TabletReshardJob {
         this.reshardingPhysicalPartitions = reshardingPhysicalPartitions;
     }
 
+    @Override
     public long getDbId() {
         return dbId;
     }
@@ -115,6 +116,7 @@ public class SplitTabletJob extends TabletReshardJob {
         return tableId;
     }
 
+    @Override
     public Map<Long, ReshardingPhysicalPartition> getReshardingPhysicalPartitions() {
         return reshardingPhysicalPartitions;
     }
@@ -211,12 +213,17 @@ public class SplitTabletJob extends TabletReshardJob {
     @Override
     public void init() throws StarRocksException {
         try (LockedObject<OlapTable> lockedTable = getLockedTable(LockType.WRITE)) {
-            reserveTableForReshard(dbId, lockedTable.get(), reshardingPhysicalPartitions);
+            initLocked(lockedTable.get());
         } catch (TabletReshardException e) {
-            // Surface admission rejection (table not NORMAL / dropped) as a checked exception so
+            // Surface admission rejection (table in another alter state / dropped) as a checked exception so
             // callers' StarRocksException handling (e.g. TabletPreSplitCoordinator) takes effect.
             throw new StarRocksException(e.getMessage(), e);
         }
+    }
+
+    @Override
+    protected void initLocked(OlapTable table) throws StarRocksException {
+        reserveTableForReshard(dbId, table, reshardingPhysicalPartitions);
     }
 
     /*
@@ -234,7 +241,6 @@ public class SplitTabletJob extends TabletReshardJob {
         // 1. Begin transaction (allocate transaction id)
         GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
         transactionId = globalStateMgr.getGlobalTransactionMgr().getTransactionIDGenerator().getNextTransactionId();
-        gtid = globalStateMgr.getGtidGenerator().nextGtid();
 
         // 2. Create new shards on StarOS — the last "abortable" step before the no-abort
         //    boundary below. No table lock needed: init() already moved the
@@ -247,16 +253,24 @@ public class SplitTabletJob extends TabletReshardJob {
         // 3. Commit transaction (update next version)
         // NOTE: After updateNextVersions(), the table's next version is advanced.
         // From this point the job must not abort or throw, because the run() wrapper would attempt to abort.
-        updateNextVersions();
+        // Steps 4-6 stay under the same lock, so the reservation is journaled (step 6) before a load can commit
+        // above it. A load journaled first would leave a new leader with the load but not the reservation, and
+        // the reserved version would never be published.
+        try (LockedObject<OlapTable> lockedTable = getLockedTable(LockType.WRITE)) {
+            // Same lock as the version reservation, so the gtid falls between those of commits before and after.
+            // Drawn first, so a failure here leaves no version reserved.
+            gtid = globalStateMgr.getGtidGenerator().nextGtid();
+            updateNextVersions(lockedTable.get());
 
-        // 4. Add new tablets to inverted index
-        addTabletsToInvertedIndex();
+            // 4. Add new tablets to inverted index
+            addTabletsToInvertedIndex();
 
-        // 5. Register resharding tablets
-        registerReshardingTablets();
+            // 5. Register resharding tablets
+            registerReshardingTablets();
 
-        // 6. Set job state to PREPARING
-        setJobState(JobState.PREPARING);
+            // 6. Set job state to PREPARING
+            setJobState(JobState.PREPARING);
+        }
     }
 
     /*
@@ -443,10 +457,8 @@ public class SplitTabletJob extends TabletReshardJob {
      * 1. Abort in-flight lake compactions, then wait for the remaining previous transactions finished
      * 2. Remove old versions of materialized index
      * 3. Unregister resharding tablets
-     * 4. Set tablet state to NORMAL
-     * 5. Update metrics
-     * 6. Release the new shards' creation-time placement pin
-     * 7. Set job state to FINISHED
+     * 4. Release the new shards' creation-time placement pin
+     * 5. Durably publish FINISHED and update aggregate table state and metrics
      */
     @Override
     protected void runCleaningJob() {
@@ -493,20 +505,11 @@ public class SplitTabletJob extends TabletReshardJob {
         // 3. Unregister resharding tablets
         unregisterReshardingTablets();
 
-        // 4. Set tablet state to NORMAL
-        setTableState(OlapTable.OlapTableState.TABLET_RESHARD, OlapTable.OlapTableState.NORMAL);
-
-        // 5. Update metrics
-        if (MetricRepo.hasInit) {
-            MetricRepo.COUNTER_TABLET_RESHARD_SPLIT_JOB_FINISHED.increase(1L);
-            MetricRepo.HISTO_TABLET_RESHARD_JOB_DURATION.update(System.currentTimeMillis() - createdTimeMs);
-        }
-
-        // 6. Release the child shards' creation-time placement pin so the balancer can spread them
+        // 4. Release the child shards' creation-time placement pin so the balancer can spread them
         //    now, instead of when the parent shards are finally reclaimed tens of minutes later.
         clearPlacementPreference(reshardingPhysicalPartitions);
 
-        // 7. Set job state to FINISHED
+        // 5. Durably publish FINISHED
         setJobState(JobState.FINISHED);
     }
 
@@ -518,9 +521,7 @@ public class SplitTabletJob extends TabletReshardJob {
     /*
      * 1. Unregister resharding tablets
      * 2. Remove new tablets from inverted index
-     * 3. Set table state to NORMAL
-     * 4. Update metrics
-     * 5. Set job state to ABORTED
+     * 3. Durably publish ABORTED and update aggregate table state and metrics
      *
      * Any orphan staros shards from a partial createShardsOnStarOS in runPendingJob are
      * reaped by StarMgrMetaSyncer's diff-and-purge cycle; no explicit deleteShards here.
@@ -533,19 +534,11 @@ public class SplitTabletJob extends TabletReshardJob {
 
             // 2. Remove new tablets from inverted index
             removeTabletsFromInvertedIndex();
-
-            // 3. Set table state to NORMAL
-            setTableState(null, OlapTable.OlapTableState.NORMAL);
         } catch (Exception e) {
             LOG.warn("Ignore exception when aborting tablet reshard job. {}. ", this, e);
         }
 
-        // 4. Update metrics
-        if (MetricRepo.hasInit) {
-            MetricRepo.COUNTER_TABLET_RESHARD_SPLIT_JOB_ABORTED.increase(1L);
-        }
-
-        // 5. Set job state to ABORTED
+        // 3. Durably publish ABORTED
         setJobState(JobState.ABORTED);
     }
 
@@ -570,7 +563,9 @@ public class SplitTabletJob extends TabletReshardJob {
     // Correspond to runPendingJob()
     @Override
     protected void replayPreparingJob() {
-        updateNextVersions();
+        try (LockedObject<OlapTable> lockedTable = getLockedTable(LockType.WRITE)) {
+            updateNextVersions(lockedTable.get());
+        }
         addTabletsToInvertedIndex();
         registerReshardingTablets();
         LOG.info("Split tablet job replayed preparing job. {}", this);
@@ -697,7 +692,12 @@ public class SplitTabletJob extends TabletReshardJob {
     private void setTableState(OlapTable.OlapTableState expectedState, OlapTable.OlapTableState newState) {
         try (LockedObject<OlapTable> lockedTable = getLockedTable(LockType.WRITE)) {
             OlapTable olapTable = lockedTable.get();
-            if (expectedState != null && olapTable.getState() != expectedState) {
+            if (newState == OlapTable.OlapTableState.NORMAL) {
+                GlobalStateMgr.getCurrentState().getTabletReshardJobMgr().refreshTableStateLocked(olapTable, jobId);
+                return;
+            }
+            if (expectedState != null && olapTable.getState() != expectedState
+                    && olapTable.getState() != OlapTable.OlapTableState.TABLET_RESHARD) {
                 throw new TabletReshardException(
                         "Unexpected table state " + olapTable.getState() + " in table " + olapTable.getName());
             }
@@ -705,32 +705,29 @@ public class SplitTabletJob extends TabletReshardJob {
         }
     }
 
-    private void updateNextVersions() {
-        try (LockedObject<OlapTable> lockedTable = getLockedTable(LockType.WRITE)) {
-            OlapTable olapTable = lockedTable.get();
-            for (ReshardingPhysicalPartition reshardingPhysicalPartition : reshardingPhysicalPartitions.values()) {
-                PhysicalPartition physicalPartition = olapTable
-                        .getPhysicalPartition(reshardingPhysicalPartition.getPhysicalPartitionId());
-                if (physicalPartition == null) {
-                    continue;
-                }
+    // The caller holds the table WRITE lock.
+    private void updateNextVersions(OlapTable olapTable) {
+        for (ReshardingPhysicalPartition reshardingPhysicalPartition : reshardingPhysicalPartitions.values()) {
+            PhysicalPartition physicalPartition = olapTable
+                    .getPhysicalPartition(reshardingPhysicalPartition.getPhysicalPartitionId());
+            if (physicalPartition == null) {
+                continue;
+            }
 
-                long commitVersion = reshardingPhysicalPartition.getCommitVersion();
-                if (commitVersion <= 0) {
-                    commitVersion = physicalPartition.getNextVersion();
-                    reshardingPhysicalPartition.setCommitVersion(commitVersion);
-                }
+            long commitVersion = reshardingPhysicalPartition.getCommitVersion();
+            if (commitVersion <= 0) {
+                commitVersion = physicalPartition.getNextVersion();
+                reshardingPhysicalPartition.setCommitVersion(commitVersion);
+            }
 
-                // Never move nextVersion backwards. The commit version is reserved here, in
-                // runPendingJob, but the job does not journal anything until it reaches PREPARING a
-                // few steps later -- so a load transaction that commits in between journals its own
-                // entry first, and a replaying FE applies that entry before this one. By then the
-                // transaction has already carried nextVersion past the version reserved here, and
-                // assigning commitVersion + 1 unconditionally would drag it back, handing the same
-                // version out twice.
-                if (physicalPartition.getNextVersion() < commitVersion + 1) {
-                    physicalPartition.setNextVersion(commitVersion + 1);
-                }
+            // Never move nextVersion backwards. runPendingJob journals the reservation before it
+            // releases the table lock, but a journal written by an FE without that ordering can
+            // still carry a load that committed between the reservation and its PREPARING entry.
+            // A replaying FE applies that load first, so the load has already carried nextVersion
+            // past the version reserved here, and assigning commitVersion + 1 unconditionally
+            // would drag it back, handing the same version out twice.
+            if (physicalPartition.getNextVersion() < commitVersion + 1) {
+                physicalPartition.setNextVersion(commitVersion + 1);
             }
         }
     }
@@ -738,12 +735,8 @@ public class SplitTabletJob extends TabletReshardJob {
     private Map<Long, TabletRange> publishVersion(List<Tablet> tablets, long commitVersion,
             boolean useAggregatePublish, ComputeResource computeResource, boolean preferSharedInitialMetadata) {
         try {
-            TxnInfoPB txnInfo = new TxnInfoPB();
-            txnInfo.txnId = transactionId;
-            txnInfo.combinedTxnLog = false;
-            txnInfo.commitTime = stateStartedTimeMs / 1000;
-            txnInfo.txnType = TxnTypePB.TXN_TABLET_RESHARD;
-            txnInfo.gtid = gtid;
+            TxnInfoPB txnInfo = TxnInfoHelper.forJobPublish(transactionId, TxnTypePB.TXN_TABLET_RESHARD,
+                    stateStartedTimeMs, gtid);
             // Carry the table's colocate column count once at the txn level (single split job =
             // single txn). 0 = non-colocate range table, BE keeps pre-P3 splitter behavior.
             ColocateTableIndex idx = GlobalStateMgr.getCurrentState().getColocateTableIndex();

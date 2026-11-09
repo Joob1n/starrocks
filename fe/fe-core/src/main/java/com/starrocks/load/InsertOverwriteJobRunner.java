@@ -352,7 +352,9 @@ public class InsertOverwriteJobRunner {
         try {
             OlapTable targetTable;
             targetTable = checkAndGetTable(db, tableId);
-            if (targetTable.getState() != OlapTable.OlapTableState.NORMAL) {
+            if (targetTable.getState() != OlapTable.OlapTableState.NORMAL
+                    && !(targetTable.getState() == OlapTable.OlapTableState.TABLET_RESHARD
+                        && targetTable.isCloudNativeTableOrMaterializedView() && targetTable.isRangeDistribution())) {
                 throw new DmlException("table state is %s, please wait to insert overwrite until table state is normal",
                         targetTable.getState());
             }
@@ -574,6 +576,10 @@ public class InsertOverwriteJobRunner {
             List<String> partitionNamesToDrop = new ArrayList<>();
             if (job.getTmpPartitionIds() != null) {
                 for (long pid : job.getTmpPartitionIds()) {
+                    // A temp partition that was already swapped in keeps its id and is live now, so leave it alone.
+                    if (!targetTable.isTempPartition(pid)) {
+                        continue;
+                    }
                     LOG.info("drop temp partition:{}", pid);
                     Partition partition = targetTable.getPartition(pid);
                     if (partition != null) {
@@ -727,6 +733,9 @@ public class InsertOverwriteJobRunner {
         try {
             if (job.getTmpPartitionIds() != null) {
                 for (long pid : job.getTmpPartitionIds()) {
+                    if (!targetTable.isTempPartition(pid)) {
+                        continue;
+                    }
                     LOG.info("drop temp partition:{}", pid);
                     Partition partition = targetTable.getPartition(pid);
                     if (partition != null) {
