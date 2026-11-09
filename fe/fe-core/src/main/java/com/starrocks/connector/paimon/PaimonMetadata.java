@@ -348,6 +348,11 @@ public class PaimonMetadata implements ConnectorMetadata {
 
     @Override
     public Table getTable(ConnectContext context, String dbName, String tblName) {
+        String baseName = PaimonIndexTable.baseTableName(tblName);
+        if (!baseName.equals(tblName)) {
+            Table baseTable = getTable(context, dbName, baseName);
+            return baseTable instanceof PaimonTable ? new PaimonIndexTable((PaimonTable) baseTable) : null;
+        }
         Identifier identifier = new Identifier(dbName, tblName);
         if (tables.containsKey(identifier)) {
             return tables.get(identifier);
@@ -412,7 +417,7 @@ public class PaimonMetadata implements ConnectorMetadata {
     public TvrVersionRange getTableVersionRange(String dbName, Table table,
                                                 Optional<ConnectorTableVersion> startVersion,
                                                 Optional<ConnectorTableVersion> endVersion) {
-        PaimonTable paimonTable = (PaimonTable) table;
+        PaimonTable paimonTable = (PaimonTable) PaimonIndexTable.metadataTable(table);
         String branch = endVersion.map(PaimonMetadata::requestedBranch).orElse(DEFAULT_MAIN_BRANCH);
         String startBranch = startVersion.map(PaimonMetadata::requestedBranch).orElse(branch);
         if (!branch.equals(startBranch)) {
@@ -546,6 +551,10 @@ public class PaimonMetadata implements ConnectorMetadata {
 
     @Override
     public boolean tableExists(ConnectContext context, String dbName, String tableName) {
+        String baseName = PaimonIndexTable.baseTableName(tableName);
+        if (!baseName.equals(tableName)) {
+            return getTable(context, dbName, tableName) != null;
+        }
         try {
             paimonNativeCatalog.getTable(Identifier.create(dbName, tableName));
             return true;

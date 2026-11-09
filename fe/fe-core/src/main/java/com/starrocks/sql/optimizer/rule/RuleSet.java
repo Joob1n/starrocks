@@ -49,6 +49,7 @@ import com.starrocks.sql.optimizer.rule.implementation.MysqlScanImplementationRu
 import com.starrocks.sql.optimizer.rule.implementation.NestLoopJoinImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.OdpsScanImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.OlapScanImplementationRule;
+import com.starrocks.sql.optimizer.rule.implementation.PaimonIndexScanImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.PaimonScanImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.ProjectImplementationRule;
 import com.starrocks.sql.optimizer.rule.implementation.RawValuesImplementationRule;
@@ -201,6 +202,7 @@ public class RuleSet {
             new HudiScanImplementationRule(),
             new DeltaLakeScanImplementationRule(),
             new PaimonScanImplementationRule(),
+            new PaimonIndexScanImplementationRule(),
             new OdpsScanImplementationRule(),
             new IcebergMetadataScanImplementationRule(),
             new KuduScanImplementationRule(),
