@@ -520,8 +520,8 @@ public class LogicalPlanPrinter {
         }
 
         @Override
-        public OperatorStr visitPhysicalIndexScan(OptExpression optExpression, Integer step) {
-            return visitScanCommon(optExpression, step, "CONNECTOR INDEX SCAN");
+        public OperatorStr visitPhysicalPaimonIndexScan(OptExpression optExpression, Integer step) {
+            return visitScanCommon(optExpression, step, "PAIMON INDEX SCAN");
         }
 
         @Override

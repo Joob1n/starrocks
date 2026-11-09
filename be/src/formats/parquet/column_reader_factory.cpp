@@ -14,13 +14,21 @@
 
 #include "formats/parquet/column_reader_factory.h"
 
+#include <optional>
+
 #include "base/failpoint/fail_point.h"
+#include "column/column_helper.h"
+#include "column/datum_convert.h"
 #include "column/variant_path_parser.h"
 #include "formats/parquet/complex_column_reader.h"
 #include "formats/parquet/scalar_column_reader.h"
 #include "formats/parquet/schema.h"
 #include "formats/parquet/utils.h"
+#include "formats/scan_context.h"
 #include "formats/utils.h"
+#include "runtime/mem_pool.h"
+#include "runtime/type_info_allocator_adapter.h"
+#include "types/type_info.h"
 
 namespace starrocks::parquet {
 
@@ -364,6 +372,111 @@ bool any_reader_not_null(const std::map<std::string, std::unique_ptr<ColumnReade
 
 } // anonymous namespace
 
+static bool is_readable_level_source(const ParquetField& field) {
+    return field.type == ColumnType::SCALAR && variant_typed_desc_from_parquet_field(&field).type != TYPE_VARIANT;
+}
+
+// The first readable scalar leaf under `field` reached through structs only, depth first. A leaf under a list or
+// map has one value per element, not per row, so it cannot give the row count.
+static const ParquetField* find_readable_struct_leaf(const ParquetField& field) {
+    if (is_readable_level_source(field)) {
+        return &field;
+    }
+    if (field.type != ColumnType::STRUCT) {
+        return nullptr;
+    }
+    for (const auto& child : field.children) {
+        if (const ParquetField* leaf = find_readable_struct_leaf(child); leaf != nullptr) {
+            return leaf;
+        }
+    }
+    return nullptr;
+}
+
+// The type a level source is read as: a scalar as itself; a list, map or struct down to a single readable leaf, so
+// that only that leaf's column is read. nullopt when no leaf under `field` is readable.
+static std::optional<TypeDescriptor> level_source_read_type(const ParquetField& field) {
+    if (is_readable_level_source(field)) {
+        return variant_typed_desc_from_parquet_field(&field);
+    }
+    switch (field.type) {
+    case ColumnType::ARRAY:
+        if (!field.children.empty()) {
+            if (auto element = level_source_read_type(field.children[0]); element.has_value()) {
+                return TypeDescriptor::create_array_type(*element);
+            }
+        }
+        return std::nullopt;
+    case ColumnType::MAP:
+        // An unknown key or value type is not read (see ColumnReaderFactory::create).
+        if (field.children.size() >= 2) {
+            if (auto key = level_source_read_type(field.children[0]); key.has_value()) {
+                return TypeDescriptor::create_map_type(*key, TYPE_UNKNOWN_DESC);
+            }
+            if (auto value = level_source_read_type(field.children[1]); value.has_value()) {
+                return TypeDescriptor::create_map_type(TYPE_UNKNOWN_DESC, *value);
+            }
+        }
+        return std::nullopt;
+    case ColumnType::STRUCT:
+        for (const auto& child : field.children) {
+            if (auto child_type = level_source_read_type(child); child_type.has_value()) {
+                return TypeDescriptor::create_struct_type({child.name}, {*child_type});
+            }
+        }
+        return std::nullopt;
+    default:
+        return std::nullopt;
+    }
+}
+
+const ParquetField* ColumnReaderFactory::find_struct_level_source(const ParquetField& field) {
+    // Its values are read and dropped, so prefer a fixed-width one over a byte array.
+    const ParquetField* byte_array = nullptr;
+    for (const auto& child : field.children) {
+        if (!is_readable_level_source(child)) {
+            continue;
+        }
+        if (child.physical_type != tparquet::Type::BYTE_ARRAY &&
+            child.physical_type != tparquet::Type::FIXED_LEN_BYTE_ARRAY) {
+            return &child;
+        }
+        if (byte_array == nullptr) {
+            byte_array = &child;
+        }
+    }
+    if (byte_array != nullptr) {
+        return byte_array;
+    }
+    // No direct scalar subfield: a leaf under a struct subfield also has one value per row and carries this
+    // struct's def levels.
+    for (const auto& child : field.children) {
+        if (child.type != ColumnType::STRUCT) {
+            continue;
+        }
+        if (const ParquetField* leaf = find_readable_struct_leaf(child); leaf != nullptr) {
+            return leaf;
+        }
+    }
+    // Only lists or maps are stored: one of them, read through its own list or map reader down to one leaf, still
+    // gives one entry per row, and its levels carry this struct's def levels (the extra repetition levels are
+    // skipped by the struct and by any enclosing list). Without it, a struct in a list would make the whole list
+    // NULL.
+    for (const auto& child : field.children) {
+        if ((child.type == ColumnType::ARRAY || child.type == ColumnType::MAP) &&
+            level_source_read_type(child).has_value()) {
+            return &child;
+        }
+    }
+    // No direct list or map: a struct subfield holding one is read the same way through its struct reader.
+    for (const auto& child : field.children) {
+        if (child.type == ColumnType::STRUCT && level_source_read_type(child).has_value()) {
+            return &child;
+        }
+    }
+    return nullptr;
+}
+
 Status VariantShreddedReadHints::add_path(std::string path) {
     ASSIGN_OR_RETURN(auto parsed_path, VariantPathParser::parse_shredded_path(std::string_view(path)));
     shredded_paths.emplace_back(std::move(path));
@@ -448,11 +561,25 @@ StatusOr<ColumnReaderPtr> ColumnReaderFactory::create(const ColumnReaderOptions&
                                                                  lake_schema_field, parquet_has_field_id);
 
         std::map<std::string, ColumnReaderPtr> children_readers;
+        std::map<std::string, ColumnPtr> default_columns;
         for (size_t i = 0; i < col_type.children.size(); i++) {
             const ParquetField* parquet_child = mapping.parquet_children[i];
             if (parquet_child == nullptr) {
                 // subfield not existed in the file; we need to emplace nullptr
                 children_readers.emplace(col_type.field_names[i], nullptr);
+                const TIcebergSchemaField* lake_child = mapping.lake_children[i];
+                if (lake_child != nullptr && lake_child->__isset.initial_default &&
+                    !col_type.children[i].is_complex_type()) {
+                    // A type the default parser does not support keeps reading NULL, as before
+                    // defaults were filled; any other failure still fails the scan.
+                    auto default_column = FormatScanContext::create_initial_default_column(col_type.children[i], true,
+                                                                                           lake_child->initial_default);
+                    if (default_column.ok()) {
+                        default_columns.emplace(col_type.field_names[i], std::move(default_column).value());
+                    } else if (!default_column.status().is_not_supported()) {
+                        return default_column.status();
+                    }
+                }
                 continue;
             }
             ASSIGN_OR_RETURN(
@@ -463,10 +590,19 @@ StatusOr<ColumnReaderPtr> ColumnReaderFactory::create(const ColumnReaderOptions&
 
         // maybe struct subfield ColumnReader is null
         if (any_reader_not_null(children_readers)) {
-            return std::make_unique<StructColumnReader>(field, std::move(children_readers));
-        } else {
-            return nullptr;
+            return std::make_unique<StructColumnReader>(field, std::move(children_readers), std::move(default_columns));
         }
+        const ParquetField* level_source_field =
+                lake_schema_field != nullptr ? find_struct_level_source(*field) : nullptr;
+        if (level_source_field != nullptr) {
+            // Iceberg subfields added after the file was written: keep the struct's nulls and fill the defaults.
+            // Readers keep a pointer to their type, so it lives in the struct reader.
+            auto level_source_type = std::make_unique<TypeDescriptor>(*level_source_read_type(*level_source_field));
+            ASSIGN_OR_RETURN(ColumnReaderPtr level_source, create(opts, level_source_field, *level_source_type));
+            return std::make_unique<StructColumnReader>(field, std::move(children_readers), std::move(default_columns),
+                                                        std::move(level_source), std::move(level_source_type));
+        }
+        return nullptr;
     } else {
         if (col_type.type == TYPE_GEOGRAPHY) {
             if (lake_schema_field == nullptr) {
@@ -477,6 +613,34 @@ StatusOr<ColumnReaderPtr> ColumnReaderFactory::create(const ColumnReaderOptions&
         return std::make_unique<ScalarColumnReader>(field, &opts.row_group_meta->columns[field->physical_column_index],
                                                     &col_type, opts);
     }
+}
+
+StatusOr<ColumnReaderPtr> ColumnReaderFactory::create_array_offsets_only(const ColumnReaderOptions& opts,
+                                                                         const ParquetField* field,
+                                                                         const TypeDescriptor& col_type) {
+    if (field->type != ColumnType::ARRAY || col_type.type != TYPE_ARRAY || col_type.children.size() != 1 ||
+        col_type.children[0].type != TYPE_STRUCT || !field->has_same_complex_type(col_type)) {
+        return nullptr;
+    }
+    const ParquetField* element = &field->children[0];
+    if (!element->has_struct_layout()) {
+        return nullptr;
+    }
+    const ParquetField* level_source_field = find_struct_level_source(*element);
+    if (level_source_field == nullptr) {
+        return nullptr;
+    }
+    // The list reader takes its offsets from the element's levels, which a leaf of the element carries in full.
+    std::map<std::string, ColumnReaderPtr> children_readers;
+    for (const auto& name : col_type.children[0].field_names) {
+        children_readers.emplace(name, nullptr);
+    }
+    auto level_source_type = std::make_unique<TypeDescriptor>(*level_source_read_type(*level_source_field));
+    ASSIGN_OR_RETURN(ColumnReaderPtr level_source, create(opts, level_source_field, *level_source_type));
+    auto element_reader = std::make_unique<StructColumnReader>(element, std::move(children_readers),
+                                                               std::map<std::string, ColumnPtr>{},
+                                                               std::move(level_source), std::move(level_source_type));
+    return std::make_unique<ListColumnReader>(field, std::move(element_reader));
 }
 
 StatusOr<ColumnReaderPtr> ColumnReaderFactory::create_variant_column_reader(const ColumnReaderOptions& opts,
@@ -604,10 +768,9 @@ StructSubfieldMapping ColumnReaderFactory::resolve_struct_subfields(const Parque
             }
             const ParquetField* parquet_child =
                     parquet_has_field_id ? find_by_id(lake_it->second->field_id) : find_by_name(parquet_name(i));
-            if (parquet_child != nullptr) {
-                mapping.parquet_children[i] = parquet_child;
-                mapping.lake_children[i] = lake_it->second;
-            }
+            // Keep the lake child even when the file lacks the subfield: its initial-default fills the subfield.
+            mapping.parquet_children[i] = parquet_child;
+            mapping.lake_children[i] = lake_it->second;
         }
         return mapping;
     }

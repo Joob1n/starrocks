@@ -18,8 +18,8 @@ import com.starrocks.catalog.PaimonTable;
 import com.starrocks.connector.CatalogConnector;
 import com.starrocks.connector.ConnectorMetadata;
 import com.starrocks.connector.index.ConnectorIndexShard;
-import com.starrocks.connector.index.IndexTable;
 import com.starrocks.connector.paimon.PaimonGlobalIndexRequest;
+import com.starrocks.connector.paimon.PaimonIndexTable;
 import com.starrocks.credential.CloudConfiguration;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.expression.BinaryType;
@@ -43,13 +43,13 @@ import java.util.List;
 
 /** Scan node that evaluates one Paimon Global Index row-id range per scan range. */
 public final class PaimonIndexScanNode extends ScanNode {
-    private final IndexTable indexTable;
+    private final PaimonIndexTable indexTable;
     private final List<TScanRangeLocations> scanRanges = new ArrayList<>();
     private final CloudConfiguration cloudConfiguration;
     private String tablePath;
     private long snapshotId;
 
-    public PaimonIndexScanNode(PlanNodeId id, TupleDescriptor descriptor, IndexTable indexTable) {
+    public PaimonIndexScanNode(PlanNodeId id, TupleDescriptor descriptor, PaimonIndexTable indexTable) {
         super(id, descriptor, "PaimonIndexScanNode");
         this.indexTable = indexTable;
         CatalogConnector connector = GlobalStateMgr.getCurrentState().getConnectorMgr()
@@ -63,7 +63,7 @@ public final class PaimonIndexScanNode extends ScanNode {
         String queryJson = request.toJson();
         snapshotId = request.getSnapshotId();
 
-        PaimonTable table = (PaimonTable) indexTable.getInnerTable();
+        PaimonTable table = indexTable.getInnerTable();
         if (!(table.getNativeTable() instanceof FileStoreTable)) {
             throw new IllegalStateException("Paimon Global Index requires a FileStoreTable");
         }
@@ -75,6 +75,7 @@ public final class PaimonIndexScanNode extends ScanNode {
         if (!request.matchesSchema(nativeTable.schema().id(), nativeTable.schema().timeMillis())) {
             throw new IllegalArgumentException("Paimon Global Index request targets a different schema");
         }
+        request.validatePredicate(nativeTable.schema());
 
         ConnectorMetadata metadata = GlobalStateMgr.getCurrentState().getMetadataMgr()
                 .getOptionalMetadata(table.getCatalogName())
@@ -111,6 +112,7 @@ public final class PaimonIndexScanNode extends ScanNode {
         message.setNode_type(TPlanNodeType.HDFS_SCAN_NODE);
         THdfsScanNode scanNode = new THdfsScanNode();
         scanNode.setTuple_id(desc.getId().asInt());
+        HdfsScanNode.setDataCacheOptionsToThrift(scanNode, dataCacheOptions);
         if (cloudConfiguration != null) {
             HdfsScanNode.setCloudConfigurationToThrift(scanNode, cloudConfiguration);
         }
@@ -189,7 +191,7 @@ public final class PaimonIndexScanNode extends ScanNode {
 
     private static boolean isArgsColumn(ScalarOperator operator) {
         return operator instanceof ColumnRefOperator
-                && IndexTable.ARGS_COLUMN_NAME.equalsIgnoreCase(((ColumnRefOperator) operator).getName());
+                && PaimonIndexTable.ARGS_COLUMN_NAME.equalsIgnoreCase(((ColumnRefOperator) operator).getName());
     }
 
     private static IllegalArgumentException invalidArgsPredicate() {
