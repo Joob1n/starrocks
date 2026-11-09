@@ -40,6 +40,7 @@ import com.starrocks.connector.ConnectorViewDefinition;
 import com.starrocks.connector.GetRemoteFilesParams;
 import com.starrocks.connector.HdfsEnvironment;
 import com.starrocks.connector.PartitionInfo;
+import com.starrocks.connector.PointerType;
 import com.starrocks.connector.PredicateSearchKey;
 import com.starrocks.connector.RemoteFileDesc;
 import com.starrocks.connector.RemoteFileInfo;
@@ -155,7 +156,6 @@ public class PaimonMetadata implements ConnectorMetadata {
     private final ConnectorProperties properties;
     private final PaimonIndexMetadataCache indexMetadataCache;
     private final Map<Identifier, Map<String, Partition>> partitionInfos = new ConcurrentHashMap<>();
-    private final ThreadLocal<Map<String, String>> branches = new ThreadLocal<>();
 
     public PaimonMetadata(String catalogName, HdfsEnvironment hdfsEnvironment, Catalog paimonNativeCatalog,
                           ConnectorProperties properties) {
@@ -351,6 +351,11 @@ public class PaimonMetadata implements ConnectorMetadata {
 
     @Override
     public Table getTable(ConnectContext context, String dbName, String tblName) {
+        String baseName = PaimonIndexTable.baseTableName(tblName);
+        if (!baseName.equals(tblName)) {
+            Table baseTable = getTable(context, dbName, baseName);
+            return baseTable instanceof PaimonTable ? new PaimonIndexTable((PaimonTable) baseTable) : null;
+        }
         Identifier identifier = new Identifier(dbName, tblName);
         if (tables.containsKey(identifier)) {
             return tables.get(identifier);
@@ -415,7 +420,12 @@ public class PaimonMetadata implements ConnectorMetadata {
     public TvrVersionRange getTableVersionRange(String dbName, Table table,
                                                 Optional<ConnectorTableVersion> startVersion,
                                                 Optional<ConnectorTableVersion> endVersion) {
-        PaimonTable paimonTable = (PaimonTable) table;
+        PaimonTable paimonTable = (PaimonTable) PaimonIndexTable.metadataTable(table);
+        String branch = endVersion.map(PaimonMetadata::requestedBranch).orElse(DEFAULT_MAIN_BRANCH);
+        String startBranch = startVersion.map(PaimonMetadata::requestedBranch).orElse(branch);
+        if (!branch.equals(startBranch)) {
+            throw new StarRocksConnectorException("Paimon version range cannot span different branches");
+        }
         Optional<Long> start = startVersion.map(v -> getSnapshotIdFromVersion(paimonTable.getNativeTable(), v));
         Optional<Long> end = endVersion.map(v -> getSnapshotIdFromVersion(paimonTable.getNativeTable(), v));
         if (start.isEmpty() && end.isEmpty()) {
@@ -431,8 +441,20 @@ public class PaimonMetadata implements ConnectorMetadata {
             }
             return TvrTableSnapshot.of(Optional.of(snapshotId));
         } else {
-            return TvrTableDelta.of(start, end);
+            TvrVersionRange range = TvrTableDelta.of(start, end);
+            return DEFAULT_MAIN_BRANCH.equals(branch) ? range : new PaimonVersionRange(range, branch);
         }
+    }
+
+    private static String requestedBranch(ConnectorTableVersion version) {
+        ConstantOperator value = version.getConstantOperator();
+        if (version.getPointerType() == PointerType.VERSION && value.getType().isStringType()) {
+            String reference = value.getVarchar().toLowerCase(java.util.Locale.ROOT);
+            if (reference.startsWith("branch:")) {
+                return reference.substring("branch:".length());
+            }
+        }
+        return DEFAULT_MAIN_BRANCH;
     }
 
     public long getSnapshotIdFromVersion(org.apache.paimon.table.Table table, ConnectorTableVersion version) {
@@ -506,7 +528,6 @@ public class PaimonMetadata implements ConnectorMetadata {
                         throw new StarRocksConnectorException("%s does not include branch: %s",
                                 table.fullName(), refNameParts[1]);
                     }
-                    setRequestedBranch(table, identifier.getBranchNameOrDefault());
                     snapshotId = paimonTable.latestSnapshot().isPresent() ? paimonTable.latestSnapshot().get().id() : -1L;
                 } else {
                     //if tag, format like tag:t_1, return the snapshot that the tag referenced
@@ -533,6 +554,10 @@ public class PaimonMetadata implements ConnectorMetadata {
 
     @Override
     public boolean tableExists(ConnectContext context, String dbName, String tableName) {
+        String baseName = PaimonIndexTable.baseTableName(tableName);
+        if (!baseName.equals(tableName)) {
+            return getTable(context, dbName, tableName) != null;
+        }
         try {
             paimonNativeCatalog.getTable(Identifier.create(dbName, tableName));
             return true;
@@ -620,14 +645,22 @@ public class PaimonMetadata implements ConnectorMetadata {
      * @return a native paimon table with
      */
     private org.apache.paimon.table.Table getNativeTable(org.apache.paimon.table.Table nativeTable,
-                                                         TvrVersionRange tvrVersionRange) {
+                                                         TvrVersionRange tvrVersionRange,
+                                                         String databaseName, String tableName) {
+        String branch = PaimonVersionRange.branchOf(tvrVersionRange);
+        if (!DEFAULT_MAIN_BRANCH.equals(branch) && !branch.equals(CoreOptions.branch(nativeTable.options()))) {
+            try {
+                nativeTable = paimonNativeCatalog.getTable(new Identifier(databaseName, tableName, branch));
+            } catch (Catalog.TableNotExistException e) {
+                throw new StarRocksConnectorException("%s does not include branch: %s", nativeTable.fullName(), branch);
+            }
+        }
         Map<String, String> dynamicOptions = new HashMap<>();
         if (tvrVersionRange != null && tvrVersionRange.start().isPresent()
                 && tvrVersionRange.end().isPresent()) {
             // Build dynamic options for incremental-between
-            TvrTableDelta tableDelta = (TvrTableDelta) tvrVersionRange;
-            long startSnapshotId = tableDelta.start().get();
-            long endSnapshotId = tableDelta.end().get();
+            long startSnapshotId = tvrVersionRange.start().get();
+            long endSnapshotId = tvrVersionRange.end().get();
             dynamicOptions.put("incremental-between", startSnapshotId + "," + endSnapshotId);
             dynamicOptions.put("incremental-between-scan-mode", "auto");
         }
@@ -639,22 +672,23 @@ public class PaimonMetadata implements ConnectorMetadata {
         RemoteFileInfo remoteFileInfo = new RemoteFileInfo();
         PaimonTable paimonTable = (PaimonTable) table;
         long snapshotId = -1L;
-        String currentBranch = consumeRequestedBranch(paimonTable);
+        TvrVersionRange tvrVersionRange = params.getTableVersionRange();
+        String currentBranch = PaimonVersionRange.branchOf(tvrVersionRange);
+        org.apache.paimon.table.Table resolvedTable = paimonTable.getNativeTable();
         Identifier identifier = new Identifier(paimonTable.getCatalogDBName(),
                 paimonTable.getCatalogTableName(), currentBranch);
         if (!new Identifier(paimonTable.getCatalogDBName(), paimonTable.getCatalogTableName()).isSystemTable()) {
             try {
-                paimonTable.setPaimonNativeTable(paimonNativeCatalog.getTable(identifier));
+                resolvedTable = paimonNativeCatalog.getTable(identifier);
             } catch (Catalog.TableNotExistException e) {
                 throw new StarRocksConnectorException("%s does not include branch: %s",
                         paimonTable.getCatalogTableName(), currentBranch);
             }
         }
-        TvrVersionRange tvrVersionRange = params.getTableVersionRange();
         snapshotId = tvrVersionRange.end().isPresent() ? tvrVersionRange.end().get() : -1L;
 
-        org.apache.paimon.table.Table versionedPaimonTable = getNativeTable(paimonTable.getNativeTable(),
-                tvrVersionRange);
+        org.apache.paimon.table.Table versionedPaimonTable = getNativeTable(resolvedTable,
+                tvrVersionRange, paimonTable.getCatalogDBName(), paimonTable.getCatalogTableName());
         Map<String, String> options = new HashMap<>();
         if (params.isDisableGlobalIndex()) {
             options.put("global-index.enabled", "false");
@@ -671,10 +705,13 @@ public class PaimonMetadata implements ConnectorMetadata {
                     CoreOptions.GlobalIndexSearchMode.FULL.toString());
         }
 
-        org.apache.paimon.table.Table paimonNativeTable = versionedPaimonTable.copy(options);
+        // Pin the data snapshot without replacing the resolved read schema. A schema-only change
+        // may be newer than that snapshot; rewinding its schema would disagree with analyzed slots
+        // and could incorrectly authorize raw-file reads without the required type conversion.
+        org.apache.paimon.table.Table paimonNativeTable = versionedPaimonTable instanceof FileStoreTable fileStoreTable
+                ? fileStoreTable.copyWithoutTimeTravel(options) : versionedPaimonTable.copy(options);
 
         GetRemoteFilesParams copyParams = params.copy();
-        copyParams.setTableVersionRange(TvrTableSnapshot.of(snapshotId));
 
         PredicateSearchKey filter = PredicateSearchKey.of(paimonTable.getCatalogDBName(),
                 paimonTable.getCatalogTableName(), copyParams);
@@ -683,9 +720,10 @@ public class PaimonMetadata implements ConnectorMetadata {
         PaimonSplitsInfo cachedSplits = cacheSplits ? paimonSplits.get(filter) : null;
         if (cachedSplits == null) {
             ReadBuilder readBuilder = paimonNativeTable.newReadBuilder();
+            List<String> nativeFieldNames = paimonNativeTable.rowType().getFieldNames();
             int[] projected =
-                    params.getFieldNames().stream().mapToInt(name -> (paimonTable.getFieldNames().indexOf(name))).toArray();
-            List<Predicate> predicates = extractPredicates(paimonTable, params.getPredicate());
+                    params.getFieldNames().stream().mapToInt(nativeFieldNames::indexOf).toArray();
+            List<Predicate> predicates = extractPredicates(paimonNativeTable, params.getPredicate());
             boolean pruneManifestsByLimit = params.getLimit() != -1 && params.getLimit() < Integer.MAX_VALUE
                     && onlyHasPartitionPredicate(table, params.getPredicate());
             readBuilder = readBuilder.withFilter(predicates).withProjection(projected);
@@ -694,15 +732,21 @@ public class PaimonMetadata implements ConnectorMetadata {
                 readBuilder = readBuilder.withLimit((int) params.getLimit());
             }
             InnerTableScan scan = (InnerTableScan) readBuilder.newScan();
+            boolean distributedIndexApplied = false;
             if (!params.isDisableGlobalIndex()) {
-                resolvePaimonGlobalIndexResult(params.getConnectorIndexResult(),
-                        paimonNativeTable, currentBranch, tvrVersionRange).ifPresent(scan::withGlobalIndexResult);
+                Optional<GlobalIndexResult> result = resolvePaimonGlobalIndexResult(params.getConnectorIndexResult(),
+                        paimonNativeTable, currentBranch, tvrVersionRange);
+                if (result.isPresent()) {
+                    scan.withGlobalIndexResult(result.get());
+                    distributedIndexApplied = true;
+                }
             }
             PaimonMetricRegistry paimonMetricRegistry = new PaimonMetricRegistry();
             List<Split> splits = scan.withMetricRegistry(paimonMetricRegistry).plan().splits();
             traceScanMetrics(paimonMetricRegistry, splits, table.getCatalogTableName(), predicates);
 
-            PaimonSplitsInfo paimonSplitsInfo = new PaimonSplitsInfo(predicates, splits);
+            PaimonSplitsInfo paimonSplitsInfo = new PaimonSplitsInfo(
+                    predicates, splits, paimonNativeTable, distributedIndexApplied);
             if (cacheSplits) {
                 paimonSplits.put(filter, paimonSplitsInfo);
             }
@@ -728,7 +772,8 @@ public class PaimonMetadata implements ConnectorMetadata {
         PaimonTable paimonTable = (PaimonTable) table;
         org.apache.paimon.table.Table nativeTable = paimonTable.getNativeTable();
         if (!(nativeTable instanceof FileStoreTable)
-                || !DEFAULT_MAIN_BRANCH.equals(resolveIndexBranch(nativeTable.options(), getRequestedBranch(paimonTable)))
+                || !DEFAULT_MAIN_BRANCH.equals(resolveIndexBranch(nativeTable.options(),
+                        PaimonVersionRange.branchOf(versionRange)))
                 || !Boolean.parseBoolean(nativeTable.options().getOrDefault("global-index.enabled", "true"))) {
             return Optional.empty();
         }
@@ -778,7 +823,7 @@ public class PaimonMetadata implements ConnectorMetadata {
         PaimonTable paimonTable = (PaimonTable) table;
         org.apache.paimon.table.Table nativeTable = paimonTable.getNativeTable();
         if (!(nativeTable instanceof FileStoreTable)
-                || !DEFAULT_MAIN_BRANCH.equals(resolveIndexBranch(nativeTable.options(), getRequestedBranch(paimonTable)))) {
+                || !DEFAULT_MAIN_BRANCH.equals(resolveIndexBranch(nativeTable.options(), DEFAULT_MAIN_BRANCH))) {
             return List.of();
         }
         FileStoreTable fileStoreTable = (FileStoreTable) nativeTable;
@@ -921,34 +966,6 @@ public class PaimonMetadata implements ConnectorMetadata {
         return true;
     }
 
-    private void setRequestedBranch(org.apache.paimon.table.Table table, String requestedBranch) {
-        Map<String, String> requestedBranches = branches.get();
-        if (requestedBranches == null) {
-            requestedBranches = new HashMap<>();
-            branches.set(requestedBranches);
-        }
-        requestedBranches.put(tableBranchKey(table), requestedBranch);
-    }
-
-    private String consumeRequestedBranch(PaimonTable table) {
-        Map<String, String> requestedBranches = branches.get();
-        if (requestedBranches == null) {
-            return DEFAULT_MAIN_BRANCH;
-        }
-        String requestedBranch = requestedBranches.remove(tableBranchKey(table));
-        if (requestedBranches.isEmpty()) {
-            branches.remove();
-        }
-        return requestedBranch == null ? DEFAULT_MAIN_BRANCH : requestedBranch;
-    }
-
-    private String getRequestedBranch(PaimonTable table) {
-        Map<String, String> requestedBranches = branches.get();
-        return requestedBranches == null
-                ? DEFAULT_MAIN_BRANCH
-                : requestedBranches.getOrDefault(tableBranchKey(table), DEFAULT_MAIN_BRANCH);
-    }
-
     @Override
     public ConnectorIndexMetadata getIndexMetadata(Table table, TvrVersionRange versionRange) {
         if (!(table instanceof PaimonTable)) {
@@ -959,7 +976,7 @@ public class PaimonMetadata implements ConnectorMetadata {
             return ConnectorIndexMetadata.empty();
         }
         org.apache.paimon.table.Table nativeTable = paimonTable.getNativeTable();
-        String currentBranch = getRequestedBranch(paimonTable);
+        String currentBranch = PaimonVersionRange.branchOf(versionRange);
         if (!DEFAULT_MAIN_BRANCH.equals(currentBranch)) {
             try {
                 nativeTable = paimonNativeCatalog.getTable(new Identifier(
@@ -978,8 +995,7 @@ public class PaimonMetadata implements ConnectorMetadata {
         currentBranch = resolveIndexBranch(fileStoreTable.options(), currentBranch);
         // A row-id result cannot describe an incremental-between scan. A delta whose start is
         // unbounded is still a snapshot read and is therefore safe to discover against its end.
-        if (versionRange instanceof TvrTableDelta
-                && versionRange.start().isPresent() && versionRange.end().isPresent()) {
+        if (versionRange != null && versionRange.start().isPresent() && versionRange.end().isPresent()) {
             return ConnectorIndexMetadata.empty();
         }
 
@@ -998,7 +1014,7 @@ public class PaimonMetadata implements ConnectorMetadata {
             ConnectorIndexMetadata metadata = indexMetadataCache.get(cacheKey,
                     () -> PaimonIndexMetadataReader.load(fileStoreTable, resolvedSnapshot));
             Set<Integer> stableBtreeFields = metadata.getDescriptors().stream()
-                    .anyMatch(descriptor -> "btree".equals(descriptor.getProvider()))
+                    .anyMatch(descriptor -> descriptor.getType() == IndexType.RANGE)
                     ? indexMetadataCache.getStableScalarFields(catalogName, paimonTable.getCatalogDBName(),
                             paimonTable.getCatalogTableName(), fileStoreTable) : Set.of();
             return bindCurrentSchema(metadata, fileStoreTable, stableBtreeFields);
@@ -1018,9 +1034,7 @@ public class PaimonMetadata implements ConnectorMetadata {
             return requestedBranch;
         }
         String optionBranch = CoreOptions.branch(nativeOptions);
-        // getRemoteFiles consumes the ThreadLocal after replacing the PaimonTable's native table.
-        // In that production order the branch embedded in the actual native table is authoritative.
-        // Before getRemoteFiles, keep an explicit non-main request even if a catalog implementation
+        // Preserve a branch explicitly bound to the scan even when a catalog implementation
         // does not expose the branch option on the copied table.
         if (optionBranch != null
                 && (!DEFAULT_MAIN_BRANCH.equals(optionBranch) || DEFAULT_MAIN_BRANCH.equals(requestedBranch))) {
@@ -1058,15 +1072,6 @@ public class PaimonMetadata implements ConnectorMetadata {
         }
     }
 
-    private static String tableBranchKey(PaimonTable table) {
-        return table.getCatalogDBName() + "." + table.getCatalogTableName();
-    }
-
-    private static String tableBranchKey(org.apache.paimon.table.Table table) {
-        String[] names = table.fullName().split("\\.");
-        return names.length < 2 ? table.fullName() : names[names.length - 2] + "." + names[names.length - 1];
-    }
-
     private static ConnectorIndexMetadata bindCurrentSchema(
             ConnectorIndexMetadata metadata, FileStoreTable table, Set<Integer> stableBtreeFields) {
         Map<String, Integer> currentFields = table.rowType().getFields().stream()
@@ -1080,7 +1085,7 @@ public class PaimonMetadata implements ConnectorMetadata {
                 .collect(Collectors.toSet());
         List<ConnectorIndexDescriptor> currentDescriptors = metadata.getDescriptors().stream()
                 .filter(descriptor -> currentFieldIds.contains(descriptor.getFieldId()))
-                .filter(descriptor -> !"btree".equals(descriptor.getProvider())
+                .filter(descriptor -> descriptor.getType() != IndexType.RANGE
                         || stableBtreeFields.contains(descriptor.getFieldId()))
                 .map(descriptor -> descriptor.withColumnName(currentFieldNames.get(descriptor.getFieldId())))
                 .collect(Collectors.toList());
@@ -1163,7 +1168,8 @@ public class PaimonMetadata implements ConnectorMetadata {
             if (!session.getSessionVariable().enablePaimonColumnStatistics()) {
                 return defaultStatistics(columns, table, predicate, limit, versionRange, disableGlobalIndex);
             }
-            org.apache.paimon.table.Table nativeTable = getNativeTable(((PaimonTable) table).getNativeTable(), versionRange);
+            org.apache.paimon.table.Table nativeTable = getNativeTable(((PaimonTable) table).getNativeTable(), versionRange,
+                    table.getCatalogDBName(), table.getCatalogTableName());
             Optional<org.apache.paimon.stats.Statistics> statistics = nativeTable.statistics();
             if (!statistics.isPresent() || statistics.get().colStats() == null
                     || !statistics.get().mergedRecordCount().isPresent()) {
@@ -1274,11 +1280,11 @@ public class PaimonMetadata implements ConnectorMetadata {
         return rowCount;
     }
 
-    private List<Predicate> extractPredicates(PaimonTable paimonTable, ScalarOperator predicate) {
+    private List<Predicate> extractPredicates(org.apache.paimon.table.Table nativeTable, ScalarOperator predicate) {
         List<ScalarOperator> scalarOperators = Utils.extractConjuncts(predicate);
         List<Predicate> predicates = new ArrayList<>(scalarOperators.size());
 
-        PaimonPredicateConverter converter = new PaimonPredicateConverter(paimonTable.getNativeTable().rowType());
+        PaimonPredicateConverter converter = new PaimonPredicateConverter(nativeTable.rowType());
         for (ScalarOperator operator : scalarOperators) {
             Predicate filter = converter.convert(operator);
             if (filter != null) {

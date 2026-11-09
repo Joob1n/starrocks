@@ -268,11 +268,35 @@ Used for MySQL client compatibility. No practical usage.
 ### blacklist_backup_routing
 
 * **Scope**: Session
-* **Description**: In shared-data mode, if the compute node the plan prefers for a scan is not among the workers available to the current query (for example, the node is down or appears on the host blocklist), the planner must choose a backup compute node. This variable sets how that backup is chosen among eligible nodes (other than the primary). `RANDOM` samples uniformly at random from the eligible set. `CIRCULAR` walks the sorted compute node id ring from the primary and takes the first eligible node (deterministic). Which nodes are eligible for backup also depends on `skip_black_list`: by default, nodes on the host blocklist are excluded; if `skip_black_list` is `true`, a node that is on the blocklist may still be chosen as a backup when it is otherwise available (for example, alive and in the warehouse).
-* **Default**: `CIRCULAR`
+* **Description**: In shared-data mode, if the compute node the plan prefers for a scan is not among the workers available to the current query (for example, the node is down or appears on the host blocklist), the planner must choose a backup compute node. This variable sets how that backup is chosen among eligible nodes (other than the primary). `RANDOM` samples uniformly at random from the eligible set. `CIRCULAR` walks the sorted compute node id ring from the primary and takes the first eligible node (deterministic). `TABLET_HASH` takes the eligible node with the highest hash of the tablet and the node (rendezvous hashing): the tablets of an unavailable node spread evenly over the other nodes, while each tablet keeps going to the same backup across queries, so its data is cached on only one backup node. For a colocated scan, the hash uses the colocation group and the bucket instead of the tablet, so every table in the group sends the same bucket to the same backup. FEs choose the same backup for a tablet as long as they see the same set of eligible nodes. The variable also applies when a load (for example, `INSERT`) writes to a tablet whose compute node is unavailable. Which nodes are eligible for backup also depends on `skip_black_list`: by default, nodes on the host blocklist are excluded; if `skip_black_list` is `true`, a node that is on the blocklist may still be chosen as a backup when it is otherwise available (for example, alive and in the warehouse).
+* **Default**: `TABLET_HASH`
 * **Data type**: String
-* **Valid values**: `CIRCULAR`, `RANDOM`
+* **Valid values**: `CIRCULAR`, `RANDOM`, `TABLET_HASH`
 * **Introduced in**: -
+
+### broadcast_mem_exceeded_penalty_factor
+
+* **Description**: Multiplier for broadcast CPU, memory, and network costs when the estimated build-side size per BE/CN exceeds the broadcast memory threshold. Set to `1.0` to disable this penalty.
+* **Scope**: Session, Global
+* **Default**: `1000.0`
+* **Data Type**: Double
+* **Valid Values**: Finite numbers in `[1.0, 1000000.0]`. Values outside this range, non-numeric values, `NaN`, and infinity are rejected.
+
+You can use `SET`, `SET GLOBAL`, or a statement-level `SET_VAR` hint. For example:
+
+```sql
+SET broadcast_mem_exceeded_penalty_factor = 10.0;
+SET GLOBAL broadcast_mem_exceeded_penalty_factor = 10.0;
+```
+
+### broadcast_mem_threshold
+
+* **Description**: Sets the estimated build-side size threshold above which the optimizer penalizes broadcast plans. The threshold applies to the estimated bytes sent to each backend. An estimate equal to the threshold receives no penalty. This is an optimizer threshold, not a runtime memory limit. It is independent of `exec_mem_limit`; `broadcast_row_limit` still controls the row-count check for broadcast selection. Setting this variable to `0` penalizes every broadcast with a positive estimated size.
+* **Scope**: Session, Global
+* **Default**: `2147483648` (2 GiB)
+* **Unit**: Byte
+* **Data Type**: long
+* **Valid Values**: [0, 9223372036854775807]
 
 ### broadcast_row_limit
 
@@ -736,6 +760,12 @@ Used for MySQL client compatibility. No practical usage.
 * **Default**: true
 * **Introduced in**: v3.3.0
 
+### enable_gather_fragment_child_affinity
+
+* **Description**: Whether to schedule the gather fragment (the single-instance result fragment with `DataPartition = UNPARTITIONED`) on a BE that already runs one of its child fragments, instead of selecting a BE via global round-robin. In shared-nothing clusters that use `labels.location`, this prevents the gather fragment from being placed on a BE that the rest of the query does not use. It does not guarantee label isolation by itself: if any other fragment of the query runs outside the label, the gather fragment may also run there. Known cases include scans of external catalog tables (such as Hive or Iceberg), `choose_execute_instances_mode` values other than `LOCALITY`, `prefer_compute_node=true`, and right or full bucket-shuffle joins with pruned buckets. If the gather fragment has no child instances, it falls back to round-robin.
+* **Default**: false
+* **Introduced in**: v4.2
+
 ### enable_gin_filter
 
 * **Description**: Whether to utilize the [fulltext inverted index](../table_design/indexes/inverted_index.md) during queries.
@@ -768,6 +798,18 @@ Default value: `true`, which means global RF is enabled. If this feature is disa
 * **Default**: false, which means this feature is disabled.
 * **Introduced in**: v3.1.4
 
+### enable_iceberg_eq_delete_runtime_filter_pruning
+
+* **Description**: Whether runtime filters can skip the equality delete files of an Iceberg table. It applies when the table has never changed its partition spec and every partition field is an identity transform of an INT, DATE, or STRING column that the query reads. A runtime filter that a join builds on such a column then skips the equality delete files of the partitions it rejects. Set it to `false` to apply every equality delete file, for example when a query fails with an error that names this variable.
+* **Default**: true
+* **Introduced in**: v26.2
+
+### enable_iceberg_function_predicate_pruning
+
+* **Description**: Whether a predicate on a function of an Iceberg column can skip data files. StarRocks converts such a predicate into a condition on the column itself, for example `year(dt) = 2024` into `dt >= '2024-01-01' AND dt < '2025-01-01'`, so that files are skipped through any partition transform of the column (`year`, `month`, `day`, `hour`, `truncate`) and through file column statistics. It applies to `year()`, `to_date()`, `date()`, `date_trunc()`, `date_format()` with a zero-padded format such as `'%Y-%m'`, `datediff()`, `weeks_add()`/`hours_add()`/`minutes_add()`/`seconds_add()` and their `_sub` forms, `year() = ... AND month()/quarter() = ...`, `left()`/`substr(s, 1, n)` compared for equality, and `starts_with()`. The original predicate is still evaluated on the rows. Set it to `false` to plan such queries as before, for example to compare results.
+* **Default**: true
+* **Introduced in**: v26.2
+
 ### enable_incremental_mv
 
 * **Description**: Session flag that controls whether the server will plan and keep an in-memory plan for materialized views that use incremental refresh. When enabled, `MaterializedViewAnalyzer.planMVQuery` will proceed for create-MV statements whose refresh scheme is an `IncrementalRefreshSchemeDesc`: it builds the logical and physical plan for the view query and sets the session `enableMVPlanner` flag (`setMVPlanner(true)`). When disabled, planning for incremental-refresh MVs is skipped. Accessible via `isEnableIncrementalRefreshMV()` and `setEnableIncrementalRefreshMv(boolean)` in `SessionVariable`.
@@ -778,7 +820,7 @@ Default value: `true`, which means global RF is enabled. If this feature is disa
 
 ### enable_insert_partial_update
 
-* **Description**: Whether to enable Partial Update for INSERT statements on Primary Key tables. When this item is set to `true` (default), if an INSERT statement specifies only a subset of columns (fewer than the number of all non-generated columns in the table), the system performs a Partial Update to update only the specified columns while preserving existing values in other columns. When set to `false`, the system uses default values for unspecified columns instead of preserving existing values. This feature is particularly useful for updating specific columns in Primary Key tables without affecting other column values.
+* **Description**: Whether to enable Partial Update for INSERT statements on Primary Key tables. When this item is set to `true` (default), if an INSERT statement specifies only a subset of columns (fewer than the number of all non-generated columns in the table), the system performs a Partial Update to update only the specified columns while preserving existing values in other columns. When set to `false`, the system uses default values for unspecified columns instead of preserving existing values. This feature is particularly useful for updating specific columns in Primary Key tables without affecting other column values. If no transaction has ever committed to the target partitions, there are no existing values to preserve, so the INSERT runs as a plain insert that fills the unspecified columns with default values and skips the Partial Update processing. This applies only when every unspecified column can be filled that way (it is nullable or has a default value, and is not an AUTO_INCREMENT column), and not to INSERT OVERWRITE or to an INSERT inside an explicit transaction (`BEGIN ... COMMIT`), which keep the Partial Update. If another write reaches those partitions first, the INSERT is automatically planned and run once more as a Partial Update.
 * **Default**: true
 * **Introduced in**: v3.3.20, v3.4.9, v3.5.8, v4.0.2
 
@@ -1588,12 +1630,32 @@ Used for MySQL client compatibility. No practical usage.
 
 ### paimon_reader_mode
 
-* **Description**: Controls the reader used for Paimon tables. Valid values are `AUTO`, `JNI`, and `NATIVE` (case-insensitive). `AUTO` lets StarRocks automatically choose the appropriate reader. `JNI` always uses the JNI reader. `NATIVE` uses the paimon-cpp native reader. Note that `paimon_force_jni_reader` takes precedence over this variable: if it is set to `true`, the JNI reader is always used.
+* **Description**: Controls the reader used for Paimon tables. Valid values are `AUTO`, `JNI`, and `NATIVE` (case-insensitive).
+
+  * `AUTO`: StarRocks automatically selects an appropriate reader.
+  * `JNI`: Forces the Paimon Java reader through JNI.
+  * `NATIVE`: Uses the StarRocks file reader when compatible; otherwise requires a compatible paimon-cpp read. The query fails instead of falling back to JNI.
+  * Setting `paimon_force_jni_reader=true` is equivalent to selecting `JNI` and takes precedence over this variable.
 * **Default**: AUTO
 * **Data type**: String
 * **Introduced in**: v4.2
 
 ### paimon_global_index_scan_stage
+
+* **Description**: Controls Paimon Global Index evaluation for the current query. The original SQL filter is always retained. Change the value with `SET`; no restart is required.
+* **Default**: 1
+* **Data type**: Integer
+* **Introduced in**: v4.2
+
+| Value | Behavior |
+| --- | --- |
+| `0` | Disables index discovery and SDK global-index evaluation, including during statistics planning. |
+| `1` | Uses Paimon Java SDK split planning. |
+| `2` | Attempts distributed scalar BTree evaluation on BEs during execution planning; uses SDK split planning when ineligible or unsuccessful. |
+
+```sql
+SET paimon_global_index_scan_stage = 2;
+```
 
 The distributed stage currently requires BTree to be the only global-index provider on each participating field. Fields with mixed providers use SDK planning.
 
@@ -1601,10 +1663,9 @@ Stage `2` runs internal queries as the caller and checks privileges on the `<tab
 
 Distributed evaluation also requires an unchanged key encoding throughout each field's schema history. Fields whose type changes alter key encoding, or whose schema history is missing, use SDK planning, even if their indexes have been rebuilt. Renames and nullability-only changes remain eligible. A schema change detected when a BE opens the index also causes SDK fallback; fallback does not guarantee that the SDK supports the schema evolution. Stage `0` disables SDK index evaluation during statistics planning as well, and stage `2` defers index evaluation until execution planning. Cancelling the outer query cancels its internal index query without starting fallback work.
 
-* **Description**: Controls Paimon Global Index evaluation. `0` disables both index discovery and SDK global-index evaluation for this query. `1` (default) uses Paimon Java SDK split planning. `2` enables distributed scalar BTree evaluation on BEs for data-evolution tables on the main branch, only when every required index completely covers the pinned snapshot. Primary-key tables, incremental scans, partially covered snapshots, unsupported predicates, and evaluation failures use SDK split planning instead. The original SQL filter is always retained. `ORDER BY ... LIMIT` on approximate vector expressions retains ordinary scan and TopN evaluation. Eligible scalar `WHERE` predicates can still use scalar indexes independently; this variable does not enable ANN planning or execution. Change the value with `SET`; no restart is required.
-* **Default**: 1
-* **Data type**: Integer
-* **Introduced in**: v4.2
+Distributed evaluation is limited to data-evolution tables on the main branch, with every required index completely covering the pinned snapshot. Primary-key tables, incremental scans, partially covered snapshots, unsupported predicates, and evaluation or result-application failures use SDK split planning. Stage `2` distributed BTree evaluation requires `paimon-cpp`. Data scans over `IndexedSplit` objects, including those returned by SDK planning, select the Paimon native or JNI reader according to `paimon_reader_mode` and schema, file-format, and split compatibility. Explicit `NATIVE` mode fails for unsupported splits instead of falling back to JNI. An `IndexedSplit` wrapping a `FallbackDataSplit` is unsupported by both readers and is rejected. EXPLAIN distinguishes a recognized index condition from an applied distributed result, SDK fallback, or distributed evaluation that was not attempted.
+
+`ORDER BY ... LIMIT` on approximate vector expressions retains ordinary scan and TopN evaluation. Eligible scalar `WHERE` predicates can still use scalar indexes independently; this variable does not enable ANN planning or execution.
 
 ### parallel_exchange_instance_num
 
@@ -1769,7 +1830,7 @@ Used for compatibility with JDBC connection pool C3P0. No practical use.
 
 ### query_queue_mem_used_pct_limit (global)
 
-* **Description**: The upper limit of memory usage percentage on a BE. It takes effect only after being set greater than `0`. Setting it to `0` indicates no limit is imposed.
+* **Description**: The upper limit of memory usage percentage on a BE. It takes effect only after being set greater than `0`. Setting it to `0` indicates no limit is imposed. Under Query Queue v1, it applies to every BE and CN node of the cluster. Under Query Queue v2, new queries wait while any alive node reaches the limit. See [Memory admission](../administration/management/resource_management/query_queues.md#memory-admission).
 * **Value range**: [0, 1]
 * **Default**: 0
 
@@ -1792,6 +1853,18 @@ Used for compatibility with JDBC connection pool C3P0. No practical use.
 * **Description**: The maximum number of IN predicates that can be used for Range partition pruning. Default value: 100. A value larger than 100 may cause the system to scan all tablets, which compromises the query performance.
 * **Default**: 100
 * **Introduced in**: v3.0
+
+### range_scan_execution_mode
+
+* **Description**: Experimental execution mode for read-only single-table aggregates on native shared-data range-colocate tables. `colocate` preserves range colocation. `parallel` gives the scan effective ANY distribution and requires Hash/Gather Exchanges to merge aggregates, including exact `COUNT DISTINCT`. Values are case-insensitive; `auto` is unsupported.
+* **Scope**: Session
+* **Default**: `colocate`
+* **Data type**: String
+* **Valid values**: `colocate`, `parallel`
+
+A nonempty parallel scan must select at least two logical partitions and two real tablets, and the selected compute resource must contain at least two eligible CNs. Among aggregates with the DISTINCT modifier, only `COUNT DISTINCT` is supported. Pipeline execution and `parallel_fragment_exec_instance_num = 1` are required. Parallel mode adds network and aggregate-state transfer costs and can increase non-owner remote reads; it does not guarantee a speedup or use of every compute node. Partition and tablet pruning remain unchanged.
+
+Parallel mode rejects writes/refreshes, joins, set operations, CTEs, subqueries, analytic functions, grouping sets, special/historical/metadata/cache-stat or sampled/hinted scans, MV/rollup source replacement, multiple final scans, Query Cache, phased scheduling, prepared physical split scans, single-node plans, and nonpipeline execution. Fully pruned input retains normal empty-aggregate semantics. Unsupported requests fail explicitly without changing other session settings.
 
 ### resource_group
 

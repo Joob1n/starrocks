@@ -310,11 +310,8 @@ void LakeServiceImpl::publish_version(::google::protobuf::RpcController* control
 
     bool is_tablet_reshard_txn = false;
     if (request->txn_infos_size() == 1 && request->txn_infos()[0].txn_type() == TXN_TABLET_RESHARD) {
-        // Tablet reshard transaction
-        if (request->resharding_tablet_infos_size() == 0) {
-            cntl->SetFailed("missing resharding_tablet_infos when txn_type is TXN_TABLET_RESHARD");
-            return;
-        }
+        // A CN may hold only indexes left unchanged by a split or merge on another CN.
+        // Their normal tablet_ids still need to advance to the partition's new version.
         is_tablet_reshard_txn = true;
         task_num += request->resharding_tablet_infos_size();
     } else { // Normal transaction
@@ -441,7 +438,8 @@ void LakeServiceImpl::publish_version(::google::protobuf::RpcController* control
                     StatusOr<TabletMetadataPtr> res;
                     if (std::chrono::system_clock::now() < timeout_deadline) {
                         res = lake::publish_version(_tablet_mgr, tablet_info, base_version, new_version, txns,
-                                                    skip_write_tablet_metadata, fe_built_version, base_version_order);
+                                                    skip_write_tablet_metadata, fe_built_version, base_version_order,
+                                                    request->is_retry_publish());
                     } else {
                         auto t = MilliSecondsSinceEpochFromTimePoint(timeout_deadline);
                         res = Status::TimedOut(fmt::format("reached deadline={}/timeout={}", t, timeout_ms));

@@ -69,7 +69,6 @@ import com.starrocks.type.DateType;
 import com.starrocks.type.FloatType;
 import com.starrocks.type.GeoTypeDescriptor;
 import com.starrocks.type.IntegerType;
-import com.starrocks.type.MapType;
 import com.starrocks.type.NullType;
 import com.starrocks.type.PrimitiveType;
 import com.starrocks.type.ScalarType;
@@ -85,6 +84,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -289,7 +289,7 @@ public class FunctionAnalyzer {
             analyzeBuiltinAggFunction(argFuncNameWithoutIf, functionParamsWithOutIf, functionCallWithoutIf);
         }
 
-        if (fn != null && fn.isAi()) {
+        if (fn != null && fn.isAI()) {
             AIFunctionAnalyzer.analyze(functionCallExpr);
         }
     }
@@ -308,19 +308,15 @@ public class FunctionAnalyzer {
                     functionCallExpr.getPos());
         }
 
-        // DISTINCT aggregation over a PERCENTILE value has no meaning and no rewrite: unlike
-        // count(distinct bitmap) / count(distinct hll) -- which the optimizer rewrites to
-        // bitmap_union_count / hll cardinality -- a PERCENTILE cannot be de-duplicated, so the
-        // call reaches the BE as a raw distinct aggregate. There it is dispatched to the
-        // string/binary distinct path and down_casts the PercentileColumn to a BinaryColumn it is
-        // not, which aborts a debug build (casts.h down_cast on BinaryColumnBase) and dereferences
-        // garbage in a release build (SIGSEGV). Reject it at analysis time instead.
         if (fnParams.isDistinct()) {
             for (Expr child : functionCallExpr.getChildren()) {
-                if (child.getType().isPercentile()) {
-                    throw new SemanticException(
-                            "DISTINCT aggregation is not supported for PERCENTILE type: " +
-                                    ExprToSql.toSql(functionCallExpr),
+                Type type = child.getType();
+                // PERCENTILE has no distinct rewrite and would reach the BE's binary distinct path;
+                // GEO has no equality/hash (and the multi-argument COUNT DISTINCT rewrite would look up
+                // a missing IF overload).
+                if (type.isPercentile() || type.isGeoType() || type.hasNestedGeoType()) {
+                    throw new SemanticException("DISTINCT aggregation is not supported for " +
+                            type.toSql().toUpperCase(Locale.ROOT) + " type: " + ExprToSql.toSql(functionCallExpr),
                             functionCallExpr.getPos());
                 }
             }
@@ -1043,14 +1039,7 @@ public class FunctionAnalyzer {
                                                         List<Type> newArgumentTypes) {
         Function fn = null;
         String fnName = node.getFunctionName();
-        if (FunctionSet.AI_COMPLETE.equalsIgnoreCase(fnName) && argumentTypes.length == 3
-                && argumentTypes[2].isNull() && !argumentTypes[0].isFileType() && !argumentTypes[1].isFileType()) {
-            // Preserve the legacy options role of an ambiguous third NULL: concrete FILE overloads otherwise
-            // precede polymorphic ANY_MAP overloads. Typed FILE arguments, including typed NULLs, are unchanged.
-            Type[] lookupTypes = argumentTypes.clone();
-            lookupTypes[2] = new MapType(NullType.NULL, NullType.NULL);
-            fn = ExprUtils.getBuiltinFunction(fnName, lookupTypes, Function.CompareMode.IS_NONSTRICT_SUPERTYPE_OF);
-        } else if (fnName.equalsIgnoreCase("typeof") && argumentTypes.length == 1) {
+        if (fnName.equalsIgnoreCase("typeof") && argumentTypes.length == 1) {
             // For the typeof function, the parameter type of the function is the result of this function.
             // At this time, the parameter type has been obtained. You can directly replace the current
             // function with StringLiteral. However, since the parent node of the current node in ast
@@ -1877,7 +1866,8 @@ public class FunctionAnalyzer {
                 newNames[j] = names[j];
             } else {
                 // Parameter not provided - use default value
-                newExprs[j] = fn.getDefaultNamedExpr(names[j]);
+                Expr defaultExpr = fn.getDefaultNamedExpr(names[j]);
+                newExprs[j] = defaultExpr == null ? null : defaultExpr.clone();
                 newNames[j] = names[j];
                 Preconditions.checkState(newExprs[j] != null,
                         "Missing default value for parameter: " + names[j]);
@@ -1914,7 +1904,7 @@ public class FunctionAnalyzer {
             com.starrocks.sql.ast.expression.Expr defaultExpr = fn.getDefaultNamedExpr(names[i]);
             Preconditions.checkState(defaultExpr != null,
                     "Missing default value for parameter: " + names[i]);
-            newExprs.add(defaultExpr);
+            newExprs.add(defaultExpr.clone());
         }
         params.setExprs(newExprs);
     }

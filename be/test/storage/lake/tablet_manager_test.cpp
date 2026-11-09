@@ -14,6 +14,7 @@
 
 #include "storage/lake/tablet_manager.h"
 
+#include <bvar/bvar.h>
 #include <fmt/format.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -22,6 +23,7 @@
 #include <chrono>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <thread>
 
 #include "base/bthreads/util.h"
@@ -31,12 +33,14 @@
 #include "base/testutil/assert.h"
 #include "base/testutil/id_generator.h"
 #include "base/utility/defer_op.h"
+#include "column/chunk_factory.h"
 #include "common/config_lake_fwd.h"
 #include "common/config_storage_fwd.h"
 #include "common/storage_define.h"
 #include "fs/fs.h"
 #include "fs/fs_util.h"
 #include "platform/store_path.h"
+#include "storage/chunk_helper.h"
 #include "storage/lake/fixed_location_provider.h"
 #include "storage/lake/join_path.h"
 #include "storage/lake/location_provider.h"
@@ -44,11 +48,15 @@
 #include "storage/lake/options.h"
 #include "storage/lake/primary_key_manager.h"
 #include "storage/lake/versioned_tablet.h"
+#include "storage/rowset/column_iterator.h"
 #include "storage/rowset/segment.h"
+#include "storage/rowset/segment_writer.h"
 #include "storage/storage_metrics.h"
 #include "storage/tablet_schema.h"
+#include "storage/tablet_schema_helper.h"
 #include "storage/utils.h"
 #include "test_util.h"
+#include "types/datum.h"
 
 // NOTE: intend to put the following header to the end of the include section
 // so that our `gutil/dynamic_annotations.h` takes precedence of the absl's.
@@ -58,6 +66,10 @@
 #include "script/script.h"
 
 namespace starrocks {
+
+static uint64_t segment_cache_schema_reject_count() {
+    return std::stoull(bvar::Variable::describe_exposed("lake_segment_cache_schema_reject_total"));
+}
 
 class LakeTabletManagerTest : public testing::Test {
 public:
@@ -75,8 +87,8 @@ public:
         CHECK_OK(FileSystem::Default()->create_dir_recursive(_location_provider->segment_root_location(1)));
         _mem_tracker = std::make_unique<MemTracker>(1024 * 1024);
         _primary_key_manager = std::make_unique<lake::PrimaryKeyManager>(_location_provider, _mem_tracker.get());
-        _tablet_manager =
-                new starrocks::lake::TabletManager(_location_provider, _primary_key_manager.get(), 1024 * 1024);
+        _tablet_manager = new starrocks::lake::TabletManager(_location_provider, _primary_key_manager.get(),
+                                                             1024 * 1024, 1024 * 1024);
     }
 
     void TearDown() override {
@@ -101,6 +113,62 @@ public:
         return fmt::format("physical/{}", virtual_path);
     }
 };
+
+struct SegmentSchemaCacheTestData {
+    std::shared_ptr<FileSystem> fs;
+    FileInfo file_info;
+    std::shared_ptr<TabletSchema> full_schema;
+    std::shared_ptr<TabletSchema> narrow_schema;
+};
+
+StatusOr<SegmentSchemaCacheTestData> write_segment_schema_cache_test_data(lake::TabletManager* tablet_manager) {
+    SegmentSchemaCacheTestData data;
+    auto key = create_int_key_pb(0, /*is_nullable=*/false);
+    key.set_name("k");
+    auto value = create_int_value_pb(1, "NONE", /*is_nullable=*/true, /*default_value=*/"77");
+    value.set_name("v");
+    data.full_schema = std::shared_ptr<TabletSchema>(TabletSchemaHelper::create_tablet_schema({key, value}, 1));
+    data.full_schema->set_id(next_id());
+    data.full_schema->set_schema_version(0);
+    data.narrow_schema = std::shared_ptr<TabletSchema>(TabletSchemaHelper::create_tablet_schema({key}, 1));
+    data.narrow_schema->set_id(next_id());
+    data.narrow_schema->set_schema_version(1);
+    data.file_info.path = tablet_manager->segment_location(1, fmt::format("schema_cache_{}.dat", next_id()));
+    ASSIGN_OR_RETURN(data.fs, FileSystemFactory::CreateSharedFromString(data.file_info.path));
+    data.file_info.fs = data.fs;
+    ASSIGN_OR_RETURN(auto wfile, data.fs->new_writable_file(data.file_info.path));
+    SegmentWriter writer(std::move(wfile), /*segment_id=*/0, data.full_schema, SegmentWriterOptions{});
+    RETURN_IF_ERROR(writer.init());
+    auto chunk = ChunkFactory::new_chunk(ChunkHelper::convert_schema(data.full_schema), 3);
+    for (int32_t row = 1; row <= 3; ++row) {
+        chunk->get_column_raw_ptr_by_index(0)->append_datum(Datum(row));
+        chunk->get_column_raw_ptr_by_index(1)->append_datum(Datum(100 + row));
+    }
+    RETURN_IF_ERROR(writer.append_chunk(*chunk));
+    uint64_t file_size = 0, index_size = 0, footer_position = 0;
+    RETURN_IF_ERROR(writer.finalize(&file_size, &index_size, &footer_position));
+    data.file_info.size = file_size;
+    return data;
+}
+
+StatusOr<std::vector<int32_t>> read_segment_schema_cache_values(const SegmentSchemaCacheTestData& data,
+                                                                const std::shared_ptr<Segment>& segment) {
+    ASSIGN_OR_RETURN(auto file, data.fs->new_random_access_file_with_bundling({}, data.file_info));
+    OlapReaderStatistics stats;
+    ColumnIteratorOptions options;
+    options.stats = &stats;
+    options.read_file = file.get();
+    ASSIGN_OR_RETURN(auto iterator, segment->new_column_iterator_or_default(data.full_schema->column(1), nullptr));
+    RETURN_IF_ERROR(iterator->init(options));
+    auto values = ChunkFactory::column_from_field_type(TYPE_INT, /*is_nullable=*/true);
+    const std::vector<rowid_t> rowids{0, 1, 2};
+    RETURN_IF_ERROR(iterator->fetch_values_by_rowid(rowids.data(), rowids.size(), values.get()));
+    std::vector<int32_t> result;
+    for (size_t row = 0; row < values->size(); ++row) {
+        result.push_back(values->get(row).get_int32());
+    }
+    return result;
+}
 
 } // namespace
 
@@ -2583,6 +2651,188 @@ TEST_F(LakeTabletManagerTest, load_segment_returns_distinct_slices_for_same_path
     ASSERT_OK(fs->delete_file(path));
 }
 
+TEST_F(LakeTabletManagerTest, load_segment_schema_mismatch_reads_physical_values) {
+    ASSIGN_OR_ABORT(auto data, write_segment_schema_cache_test_data(_tablet_manager));
+    const auto cache_key = data.file_info.cache_key();
+    const LakeIOOptions options{.fill_data_cache = false, .buffer_size = 4096};
+    size_t footer_hint = 16 * 1024;
+    ASSIGN_OR_ABORT(auto cached, _tablet_manager->load_segment(data.file_info, 0, &footer_hint, options,
+                                                               /*fill_meta_cache=*/true, data.narrow_schema));
+    ASSERT_EQ(nullptr, cached->column_with_uid(1));
+    ASSIGN_OR_ABORT(auto hidden, read_segment_schema_cache_values(data, cached));
+    EXPECT_EQ(std::vector<int32_t>({77, 77, 77}), hidden);
+    for (bool fill_cache : {false, true}) {
+        SCOPED_TRACE(fill_cache);
+        const auto cache_size = _tablet_manager->metacache()->segment_metadata_memory_usage();
+        const auto rejected_before = segment_cache_schema_reject_count();
+        auto requested_file = data.file_info;
+        if (fill_cache) requested_file.fs.reset(); // Also exercise the cached Segment's shared filesystem.
+        OlapReaderStatistics open_stats;
+        ASSIGN_OR_ABORT(auto reopened, _tablet_manager->load_segment(requested_file, 0, &footer_hint, options,
+                                                                     fill_cache, data.full_schema, &open_stats));
+        EXPECT_NE(cached.get(), reopened.get());
+        EXPECT_EQ(rejected_before + 1, segment_cache_schema_reject_count());
+        EXPECT_EQ(fill_cache ? _tablet_manager : nullptr, reopened->lake_tablet_manager());
+        EXPECT_EQ(1, open_stats.segments_opened);
+        EXPECT_NE(nullptr, reopened->column_with_uid(1));
+        ASSIGN_OR_ABORT(auto values, read_segment_schema_cache_values(data, reopened));
+        EXPECT_EQ(std::vector<int32_t>({101, 102, 103}), values);
+        EXPECT_EQ(fill_cache ? reopened.get() : cached.get(),
+                  _tablet_manager->metacache()->lookup_segment(cache_key).get());
+        if (!fill_cache) EXPECT_EQ(cache_size, _tablet_manager->metacache()->segment_metadata_memory_usage());
+
+        OlapReaderStatistics repeated_stats;
+        ASSIGN_OR_ABORT(auto repeated, _tablet_manager->load_segment(data.file_info, 0, &footer_hint, options,
+                                                                     fill_cache, data.full_schema, &repeated_stats));
+        EXPECT_EQ(fill_cache ? 0 : 1, repeated_stats.segments_opened);
+        if (fill_cache) {
+            EXPECT_EQ(reopened.get(), repeated.get());
+        } else {
+            EXPECT_NE(reopened.get(), repeated.get());
+        }
+        EXPECT_EQ(rejected_before + (fill_cache ? 1 : 2), segment_cache_schema_reject_count());
+
+        // Replacing the cache entry must not mutate a Segment held by an older reader.
+        EXPECT_EQ(nullptr, cached->column_with_uid(1));
+        ASSIGN_OR_ABORT(auto old_values, read_segment_schema_cache_values(data, cached));
+        EXPECT_EQ(std::vector<int32_t>({77, 77, 77}), old_values);
+    }
+}
+
+TEST_F(LakeTabletManagerTest, load_segment_schema_mismatch_preserves_inflight_full_schema) {
+    ASSIGN_OR_ABORT(auto data, write_segment_schema_cache_test_data(_tablet_manager));
+    const auto cache_key = data.file_info.cache_key();
+    ASSIGN_OR_ABORT(auto cached, _tablet_manager->load_segment(data.file_info, 0, LakeIOOptions{},
+                                                               /*fill_meta_cache=*/true, data.full_schema));
+    for (bool fill_cache : {false, true}) {
+        SCOPED_TRACE(fill_cache);
+        const auto rejected_before = segment_cache_schema_reject_count();
+        ASSIGN_OR_ABORT(auto narrowed, _tablet_manager->load_segment(data.file_info, 0, LakeIOOptions{}, fill_cache,
+                                                                     data.narrow_schema));
+        EXPECT_NE(cached.get(), narrowed.get());
+        EXPECT_EQ(rejected_before + 1, segment_cache_schema_reject_count());
+        EXPECT_EQ(fill_cache ? _tablet_manager : nullptr, narrowed->lake_tablet_manager());
+        EXPECT_EQ(nullptr, narrowed->column_with_uid(1));
+        EXPECT_EQ(fill_cache ? narrowed.get() : cached.get(),
+                  _tablet_manager->metacache()->lookup_segment(cache_key).get());
+        if (fill_cache) {
+            OlapReaderStatistics stats;
+            size_t footer_hint = 16 * 1024;
+            ASSIGN_OR_ABORT(auto repeated,
+                            _tablet_manager->load_segment(data.file_info, 0, &footer_hint, LakeIOOptions{}, fill_cache,
+                                                          data.narrow_schema, &stats));
+            EXPECT_EQ(narrowed.get(), repeated.get());
+            EXPECT_EQ(0, stats.segments_opened);
+        }
+        ASSIGN_OR_ABORT(auto unspecified,
+                        _tablet_manager->load_segment(data.file_info, 0, LakeIOOptions{}, fill_cache, nullptr));
+        EXPECT_EQ(fill_cache ? narrowed.get() : cached.get(), unspecified.get());
+        EXPECT_EQ(rejected_before + 1, segment_cache_schema_reject_count());
+        ASSIGN_OR_ABORT(auto old_values, read_segment_schema_cache_values(data, cached));
+        EXPECT_EQ(std::vector<int32_t>({101, 102, 103}), old_values);
+    }
+    ASSIGN_OR_ABORT(auto values, read_segment_schema_cache_values(data, cached));
+    EXPECT_EQ(std::vector<int32_t>({101, 102, 103}), values);
+}
+
+TEST_F(LakeTabletManagerTest, load_segment_schema_mismatch_handles_null_cached_schema) {
+    ASSIGN_OR_ABORT(auto data, write_segment_schema_cache_test_data(_tablet_manager));
+    auto marker = std::make_shared<Segment>(data.fs, data.file_info, 0, nullptr, _tablet_manager);
+    const auto cache_key = data.file_info.cache_key();
+    _tablet_manager->metacache()->cache_segment(cache_key, marker);
+    for (bool fill_cache : {false, true}) {
+        SCOPED_TRACE(fill_cache);
+        const auto rejected_before = segment_cache_schema_reject_count();
+        ASSIGN_OR_ABORT(auto reopened, _tablet_manager->load_segment(data.file_info, 0, LakeIOOptions{}, fill_cache,
+                                                                     data.full_schema));
+        EXPECT_NE(marker.get(), reopened.get());
+        EXPECT_EQ(rejected_before + 1, segment_cache_schema_reject_count());
+        EXPECT_EQ(fill_cache ? _tablet_manager : nullptr, reopened->lake_tablet_manager());
+        ASSIGN_OR_ABORT(auto values, read_segment_schema_cache_values(data, reopened));
+        EXPECT_EQ(std::vector<int32_t>({101, 102, 103}), values);
+        EXPECT_EQ(fill_cache ? reopened.get() : marker.get(),
+                  _tablet_manager->metacache()->lookup_segment(cache_key).get());
+        EXPECT_EQ(nullptr, marker->tablet_schema_share_ptr());
+    }
+}
+
+TEST_F(LakeTabletManagerTest, load_segment_schema_mismatch_checks_cache_insert_winner) {
+    ASSIGN_OR_ABORT(auto data, write_segment_schema_cache_test_data(_tablet_manager));
+    const auto cache_key = data.file_info.cache_key();
+    size_t footer_hint = 16 * 1024;
+    ASSIGN_OR_ABORT(auto winner, Segment::open(data.fs, data.file_info, 0, data.narrow_schema, &footer_hint, nullptr,
+                                               LakeIOOptions{}, _tablet_manager));
+    ASSERT_EQ(nullptr, _tablet_manager->metacache()->lookup_segment(cache_key));
+    int callback_count = 0;
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::load_segment:before_cache_insert", [&](void*) {
+        ++callback_count;
+        auto inserted = _tablet_manager->metacache()->cache_segment_if_absent(cache_key, winner);
+        EXPECT_EQ(winner.get(), inserted.get());
+    });
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp clear_callback([]() {
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::load_segment:before_cache_insert");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    const auto rejected_before = segment_cache_schema_reject_count();
+    ASSIGN_OR_ABORT(auto reopened, _tablet_manager->load_segment(data.file_info, 0, &footer_hint, LakeIOOptions{},
+                                                                 /*fill_meta_cache=*/true, data.full_schema));
+    ASSERT_EQ(1, callback_count);
+    EXPECT_EQ(rejected_before + 1, segment_cache_schema_reject_count());
+    EXPECT_NE(winner.get(), reopened.get());
+    EXPECT_EQ(_tablet_manager, reopened->lake_tablet_manager());
+    EXPECT_NE(nullptr, reopened->column_with_uid(1));
+    ASSIGN_OR_ABORT(auto values, read_segment_schema_cache_values(data, reopened));
+    EXPECT_EQ(std::vector<int32_t>({101, 102, 103}), values);
+    EXPECT_EQ(reopened.get(), _tablet_manager->metacache()->lookup_segment(cache_key).get());
+    EXPECT_EQ(nullptr, winner->column_with_uid(1));
+    OlapReaderStatistics stats;
+    ASSIGN_OR_ABORT(auto repeated, _tablet_manager->load_segment(data.file_info, 0, &footer_hint, LakeIOOptions{},
+                                                                 /*fill_meta_cache=*/true, data.full_schema, &stats));
+    EXPECT_EQ(reopened.get(), repeated.get());
+    EXPECT_EQ(0, stats.segments_opened);
+}
+
+TEST_F(LakeTabletManagerTest, load_segment_schema_mismatch_preserves_newer_replace_winner) {
+    ASSIGN_OR_ABORT(auto data, write_segment_schema_cache_test_data(_tablet_manager));
+    const auto cache_key = data.file_info.cache_key();
+    ASSIGN_OR_ABORT(auto old, _tablet_manager->load_segment(data.file_info, 0, LakeIOOptions{},
+                                                            /*fill_meta_cache=*/true, data.narrow_schema));
+    size_t footer_hint = 16 * 1024;
+    ASSIGN_OR_ABORT(auto winner, Segment::open(data.fs, data.file_info, 0, data.full_schema, &footer_hint, nullptr,
+                                               LakeIOOptions{}, _tablet_manager));
+    int callback_count = 0;
+    SyncPoint::GetInstance()->SetCallBack("TabletManager::load_segment:before_cache_replace", [&](void*) {
+        ++callback_count;
+        _tablet_manager->metacache()->cache_segment(cache_key, winner);
+    });
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp clear_callback([]() {
+        SyncPoint::GetInstance()->ClearCallBack("TabletManager::load_segment:before_cache_replace");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+    const auto rejected_before = segment_cache_schema_reject_count();
+    OlapReaderStatistics stats;
+    ASSIGN_OR_ABORT(auto reopened, _tablet_manager->load_segment(data.file_info, 0, &footer_hint, LakeIOOptions{},
+                                                                 /*fill_meta_cache=*/true, data.full_schema, &stats));
+    EXPECT_EQ(1, callback_count);
+    EXPECT_EQ(rejected_before + 1, segment_cache_schema_reject_count());
+    EXPECT_EQ(1, stats.segments_opened);
+    EXPECT_EQ(nullptr, reopened->lake_tablet_manager());
+    EXPECT_EQ(winner.get(), _tablet_manager->metacache()->lookup_segment(cache_key).get());
+    ASSIGN_OR_ABORT(auto values, read_segment_schema_cache_values(data, reopened));
+    EXPECT_EQ(std::vector<int32_t>({101, 102, 103}), values);
+    ASSIGN_OR_ABORT(auto old_values, read_segment_schema_cache_values(data, old));
+    EXPECT_EQ(std::vector<int32_t>({77, 77, 77}), old_values);
+    OlapReaderStatistics repeated_stats;
+    ASSIGN_OR_ABORT(auto repeated,
+                    _tablet_manager->load_segment(data.file_info, 0, &footer_hint, LakeIOOptions{},
+                                                  /*fill_meta_cache=*/true, data.full_schema, &repeated_stats));
+    EXPECT_EQ(winner.get(), repeated.get());
+    EXPECT_EQ(0, repeated_stats.segments_opened);
+    EXPECT_EQ(1, callback_count);
+}
+
 #ifdef USE_STAROS
 class MockStarOSWorker : public StarOSWorker {
 public:
@@ -2641,6 +2891,62 @@ TEST_F(LakeTabletManagerTest, tablet_schema_load_from_remote) {
     EXPECT_EQ(st.value()->num_columns(), 2);
     EXPECT_EQ(st.value()->column(0).name(), "c0");
     EXPECT_EQ(st.value()->column(1).name(), "c1");
+}
+
+// A version-1 read without a version-1 file resolves the tablet's shard to build the metadata. StarMgr
+// answers NOT_EXIST for a dropped shard, which must read as NotFound like every other version of the
+// tablet; failures that may be transient must not.
+TEST_F(LakeTabletManagerTest, resolve_shard_properties) {
+    using ShardInfoOr = absl::StatusOr<staros::starlet::ShardInfo>;
+    std::shared_ptr<StarOSWorker> origin_worker = get_staros_worker();
+    set_staros_worker_for_test(std::make_shared<MockStarOSWorker>());
+    DeferOp op([origin_worker] { set_staros_worker_for_test(origin_worker); });
+    MockStarOSWorker* worker = dynamic_cast<MockStarOSWorker*>(get_staros_worker().get());
+
+    int64_t table_id = 0;
+    int64_t partition_id = 0;
+    int64_t index_id = 0;
+
+    // StarMgr no longer has the shard.
+    auto dropped_id = next_id();
+    auto not_exist = "shard " + std::to_string(dropped_id) + " not exist.";
+    EXPECT_CALL(*worker, _fetch_shard_info_from_remote(dropped_id))
+            .WillOnce(::testing::Return(ShardInfoOr(absl::NotFoundError(not_exist))));
+    auto st = lake::TabletManager::resolve_shard_properties(dropped_id, &table_id, &partition_id, &index_id);
+    ASSERT_TRUE(st.is_not_found()) << st;
+    EXPECT_NE(std::string::npos, st.message().find(not_exist)) << st;
+
+    // Starlet is not ready yet.
+    auto unavailable_id = next_id();
+    EXPECT_CALL(*worker, _fetch_shard_info_from_remote(unavailable_id))
+            .WillOnce(::testing::Return(ShardInfoOr(absl::UnavailableError("starlet is still not ready!"))));
+    st = lake::TabletManager::resolve_shard_properties(unavailable_id, &table_id, &partition_id, &index_id);
+    ASSERT_TRUE(st.is_internal_error()) << st;
+
+    // The StarMgr RPC failed.
+    auto timeout_id = next_id();
+    EXPECT_CALL(*worker, _fetch_shard_info_from_remote(timeout_id))
+            .WillOnce(::testing::Return(ShardInfoOr(absl::DeadlineExceededError("grpc.GetShard error"))));
+    st = lake::TabletManager::resolve_shard_properties(timeout_id, &table_id, &partition_id, &index_id);
+    ASSERT_TRUE(st.is_internal_error()) << st;
+
+    // The shard resolves.
+    auto live_id = next_id();
+    staros::starlet::ShardInfo shard_info;
+    shard_info.id = live_id;
+    shard_info.properties.emplace("tableId", "11");
+    shard_info.properties.emplace("partitionId", "12");
+    shard_info.properties.emplace("indexId", "13");
+    EXPECT_CALL(*worker, _fetch_shard_info_from_remote(live_id)).WillOnce(::testing::Return(shard_info));
+    ASSERT_OK(lake::TabletManager::resolve_shard_properties(live_id, &table_id, &partition_id, &index_id));
+    EXPECT_EQ(11, table_id);
+    EXPECT_EQ(12, partition_id);
+    EXPECT_EQ(13, index_id);
+
+    // No StarOS worker at all.
+    set_staros_worker_for_test(nullptr);
+    st = lake::TabletManager::resolve_shard_properties(next_id(), &table_id, &partition_id, &index_id);
+    ASSERT_TRUE(st.is_not_found()) << st;
 }
 
 TEST_F(LakeTabletManagerTest, test_in_writing_data_size) {
@@ -3016,5 +3322,85 @@ TEST_F(LakeTabletManagerTest, pick_local_anchor_tablet_id_prefers_borrowed_over_
 }
 
 #endif // USE_STAROS
+
+namespace {
+
+TabletMetadataPB build_bundle_member_metadata(int64_t tablet_id, int64_t version, const TabletSchemaPB& schema) {
+    TabletMetadataPB metadata;
+    metadata.set_id(tablet_id);
+    metadata.set_version(version);
+    metadata.mutable_schema()->CopyFrom(schema);
+    (*metadata.mutable_historical_schemas())[schema.id()].CopyFrom(schema);
+    return metadata;
+}
+
+} // namespace
+
+// A vacuum or drop-tablet aggregator reads the metadata of every tablet in a partition but holds few of
+// them. get_tablet_metadata_via_anchor() must reach both the bundle and the per-tablet object through the
+// anchor alone, so that no non-anchor tablet location is resolved, while keying the metacache by the
+// requested tablet.
+TEST_F(LakeTabletManagerTest, get_tablet_metadata_via_anchor_resolves_only_the_anchor) {
+    const int64_t anchor_id = next_id();
+    const int64_t remote_id = next_id();
+    TabletSchemaPB schema;
+    schema.set_id(next_id());
+    schema.set_num_short_key_columns(1);
+    schema.set_keys_type(DUP_KEYS);
+    auto* c0 = schema.add_column();
+    c0->set_unique_id(0);
+    c0->set_name("c0");
+    c0->set_type("INT");
+    c0->set_is_key(true);
+    c0->set_is_nullable(false);
+
+    // Version 2 lives in the partition's bundle; version 3 of the remote tablet is a per-tablet object.
+    std::map<int64_t, TabletMetadataPB> bundle;
+    bundle.emplace(anchor_id, build_bundle_member_metadata(anchor_id, 2, schema));
+    bundle.emplace(remote_id, build_bundle_member_metadata(remote_id, 2, schema));
+    ASSERT_OK(_tablet_manager->put_bundle_tablet_metadata(bundle));
+    ASSERT_OK(_tablet_manager->put_tablet_metadata(build_bundle_member_metadata(remote_id, 3, schema)));
+
+    auto location_provider = std::make_shared<lake::AnchorOnlyLocationProvider>(
+            _test_dir, lake::join_path(_test_dir, "unreachable"), anchor_id);
+    auto old_location_provider = _tablet_manager->TEST_set_location_provider(location_provider);
+    DeferOp restore([&]() { _tablet_manager->TEST_set_location_provider(std::move(old_location_provider)); });
+    _tablet_manager->metacache()->prune();
+
+    // The plain overload resolves the remote tablet through its own location and cannot find it.
+    EXPECT_FALSE(_tablet_manager->get_tablet_metadata(remote_id, 2, false).ok());
+    _tablet_manager->metacache()->prune();
+    auto plain_resolved = location_provider->resolved_outside_partition().size();
+    EXPECT_GT(plain_resolved, 0);
+
+    // A bundled version: the first read discovers the bundle, the second takes the cached marker path.
+    for (int i = 0; i < 2; i++) {
+        ASSIGN_OR_ABORT(auto metadata, _tablet_manager->get_tablet_metadata_via_anchor(
+                                               remote_id, 2, anchor_id,
+                                               lake::CacheOptions{.fill_meta_cache = false, .fill_data_cache = false}));
+        EXPECT_EQ(remote_id, metadata->id());
+        EXPECT_EQ(2, metadata->version());
+        EXPECT_EQ(schema.id(), metadata->schema().id());
+    }
+
+    // A per-tablet version, cached under the requested tablet's own metadata path.
+    ASSIGN_OR_ABORT(auto metadata, _tablet_manager->get_tablet_metadata_via_anchor(
+                                           remote_id, 3, anchor_id,
+                                           lake::CacheOptions{.fill_meta_cache = true, .fill_data_cache = false}));
+    EXPECT_EQ(remote_id, metadata->id());
+    EXPECT_EQ(3, metadata->version());
+    EXPECT_NE(nullptr, _tablet_manager->metacache()->lookup_tablet_metadata(
+                               _tablet_manager->tablet_metadata_location(remote_id, 3)));
+
+    // A missing version still reports NotFound, so vacuum can tell the chain bottom from an error.
+    EXPECT_TRUE(_tablet_manager
+                        ->get_tablet_metadata_via_anchor(
+                                remote_id, 4, anchor_id,
+                                lake::CacheOptions{.fill_meta_cache = false, .fill_data_cache = false})
+                        .status()
+                        .is_not_found());
+
+    EXPECT_EQ(plain_resolved, location_provider->resolved_outside_partition().size());
+}
 
 } // namespace starrocks

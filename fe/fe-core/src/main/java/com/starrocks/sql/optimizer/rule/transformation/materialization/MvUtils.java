@@ -35,13 +35,17 @@ import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.RangeDistributionInfo;
 import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.Config;
 import com.starrocks.common.Pair;
-import com.starrocks.common.tvr.TvrTableDelta;
+import com.starrocks.common.tvr.TvrTableSnapshot;
 import com.starrocks.common.util.DateUtils;
 import com.starrocks.common.util.LogUtil;
 import com.starrocks.common.util.RangeUtils;
 import com.starrocks.common.util.SRStringUtils;
 import com.starrocks.common.util.TimeUtils;
+import com.starrocks.common.util.concurrent.lock.LockTimeoutException;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.mv.analyzer.MVPartitionExpr;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
@@ -138,6 +142,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.SortedSet;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -238,15 +243,16 @@ public class MvUtils {
      * <p>
      * A query period reaches the plan in one of two shapes, the same two that
      * {@link com.starrocks.sql.analyzer.AnalyzerUtils#prohibitTimeTravelQuery} has to handle on the
-     * definition side: connectors that resolve the version themselves carry a delta range on the scan,
+     * definition side: connectors that resolve the version themselves carry a non-snapshot range on the scan,
      * while a MySQL temporal read keeps the clause verbatim on the operator and leaves its range at the
      * default. An ordinary read carries a {@link com.starrocks.common.tvr.TvrTableSnapshot} of the
-     * table's current version, so only a query period produces a delta range on a freshly transformed plan.
+     * table's current version. Explicit query periods may additionally carry connector-specific identity,
+     * such as a Paimon branch, and must not become eligible for main-state MV rewrites.
      */
     public static boolean containsTimeTravelScan(OptExpression root) {
         if (root.getOp() instanceof LogicalScanOperator) {
             LogicalScanOperator scanOperator = (LogicalScanOperator) root.getOp();
-            if (scanOperator.getTvrVersionRange() instanceof TvrTableDelta) {
+            if (!(scanOperator.getTvrVersionRange() instanceof TvrTableSnapshot)) {
                 return true;
             }
             return scanOperator instanceof LogicalMysqlScanOperator
@@ -1219,20 +1225,19 @@ public class MvUtils {
     }
 
     /**
-     * Returns the maximum refresh timestamp among all partition infos.
-     * If no valid refresh time is found, returns the current system time.
+     * Returns the maximum refresh timestamp among all partition infos, or 0 when there is none -- not the
+     * wall clock: this is persisted as a base-table data timestamp, and <= 0 already means "unknown".
      */
     public static long getMaxTablePartitionInfoRefreshTime(
             Collection<Map<String, MaterializedView.BasePartitionInfo>> partitionInfos) {
         return partitionInfos.stream()
                 .map(MvUtils::getMaxTablePartitionInfoRefreshTime)
                 .max(Long::compareTo)
-                .orElseGet(System::currentTimeMillis);
+                .orElse(0L);
     }
 
     /**
-     * Returns the maximum refresh timestamp from a single partition info map.
-     * If no valid refresh time is found, returns the current system time.
+     * Returns the maximum refresh timestamp from a single partition info map, or 0 when it is empty.
      */
     public static long getMaxTablePartitionInfoRefreshTime(
             Map<String, MaterializedView.BasePartitionInfo> partitionInfos) {
@@ -1240,7 +1245,7 @@ public class MvUtils {
                 .map(MaterializedView.BasePartitionInfo::getLastRefreshTime)
                 .filter(Objects::nonNull)
                 .max(Long::compareTo)
-                .orElseGet(System::currentTimeMillis);
+                .orElse(0L);
     }
 
     public static List<ScalarOperator> collectOnPredicate(OptExpression optExpression) {
@@ -1543,6 +1548,52 @@ public class MvUtils {
     public static Table getTableChecked(BaseTableInfo baseTableInfo) {
         try (ConnectContext.ContextScope scope = ConnectContext.enterOnlyReadIcebergCacheScope(ConnectContext.get())) {
             return GlobalStateMgr.getCurrentState().getMetadataMgr().getTableChecked(scope.getContext(), baseTableInfo);
+        }
+    }
+
+    @FunctionalInterface
+    public interface BaseTableRead<T, E extends Exception> {
+        T read() throws E;
+    }
+
+    /**
+     * Run {@code read} over an internal base table of {@code mv} under the base table's READ lock, for an mv refresh.
+     * <p>
+     * An olap table's partition maps are mutated in place under its WRITE lock (automatic partition creation, TTL
+     * drops, INSERT OVERWRITE), so walking the live table without the lock fails with a
+     * ConcurrentModificationException, or looks up a partition that was dropped after its name was listed. An
+     * external base table, or one the mv does not name, is read as before: no FE lock protects it.
+     * <p>
+     * A freshness check for query rewrite, or for {@code inspect_mv_refresh_info} ({@code unlocked}), reads unlocked,
+     * as before: it runs while the planner may already hold other tables' locks, so taking a base table's lock
+     * there could wait out of order, and its staleness check may reach a connector.
+     *
+     * @throws LockTimeoutException if the lock is not acquired within {@code mv_refresh_try_lock_timeout_ms}
+     */
+    public static <T, E extends Exception> T readBaseTableUnderLock(MaterializedView mv, Table baseTable,
+                                                                    boolean unlocked,
+                                                                    BaseTableRead<T, E> read)
+            throws E, LockTimeoutException {
+        Optional<BaseTableInfo> baseTableInfo = unlocked || !baseTable.isNativeTableOrMaterializedView()
+                ? Optional.empty()
+                : mv.getBaseTableInfos().stream()
+                        .filter(info -> info.isInternalCatalog() && info.getTableId() == baseTable.getId())
+                        .findFirst();
+        if (baseTableInfo.isEmpty()) {
+            return read.read();
+        }
+        long dbId = baseTableInfo.get().getDbId();
+        Locker locker = new Locker();
+        if (!locker.tryLockTableWithIntensiveDbLock(dbId, baseTable.getId(), LockType.READ,
+                Config.mv_refresh_try_lock_timeout_ms, TimeUnit.MILLISECONDS)) {
+            throw new LockTimeoutException(String.format("Materialized view %s failed to acquire read lock on " +
+                    "base table %s within %d ms", mv.getName(), baseTable.getName(),
+                    Config.mv_refresh_try_lock_timeout_ms));
+        }
+        try {
+            return read.read();
+        } finally {
+            locker.unLockTableWithIntensiveDbLock(dbId, baseTable.getId(), LockType.READ);
         }
     }
 
