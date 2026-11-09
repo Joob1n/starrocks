@@ -525,6 +525,16 @@ public class OlapTableFactory implements AbstractTableFactory {
                         PropertyAnalyzer.PROPERTIES_ENABLE_STATISTIC_COLLECT_ON_FIRST_LOAD, true));
             }
 
+            if (properties != null &&
+                    properties.containsKey(PropertyAnalyzer.PROPERTIES_ENABLE_STATISTIC_AUTO_COLLECT)) {
+                try {
+                    table.setEnableStatisticAutoCollect(PropertyAnalyzer.analyzeBooleanPropStrictly(properties,
+                            PropertyAnalyzer.PROPERTIES_ENABLE_STATISTIC_AUTO_COLLECT, true));
+                } catch (SemanticException e) {
+                    throw new DdlException(e.getMessage(), e);
+                }
+            }
+
             try {
                 String forbiddenTimeRanges = PropertyAnalyzer.analyzeBaseCompactionForbiddenTimeRanges(properties);
                 CompactionControlScheduler.toQuartzExpression(forbiddenTimeRanges);
@@ -717,6 +727,10 @@ public class OlapTableFactory implements AbstractTableFactory {
             if (StringUtils.isNotEmpty(colocateGroup)) {
                 if (!distributionInfo.supportColocate()) {
                     throw new DdlException("random distribution does not support 'colocate_with'");
+                }
+                if (table.isRangeDistribution() && !stmt.getRollupAlterClauseList().isEmpty()) {
+                    throw new DdlException("ROLLUP is not supported in CREATE TABLE for a range distribution table with "
+                            + "'colocate_with'");
                 }
 
                 colocateTableIndex.addTableToGroup(db, table, colocateGroup, false /* afterTabletCreation */);

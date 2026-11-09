@@ -21,6 +21,7 @@ package org.apache.iceberg;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.starrocks.connector.iceberg.DataFileWrapper;
+import com.starrocks.connector.iceberg.ManifestColumnStats;
 import com.starrocks.connector.iceberg.DeleteFileWrapper;
 import org.apache.iceberg.avro.AvroIterable;
 import org.apache.iceberg.exceptions.RuntimeIOException;
@@ -39,6 +40,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.PartitionSet;
 
@@ -53,7 +55,13 @@ import java.util.function.Function;
 
 import static org.apache.iceberg.expressions.Expressions.alwaysTrue;
 
-// copy from https://github.com/apache/iceberg/blob/apache-iceberg-1.10.0/core/src/main/java/org/apache/iceberg/ManifestReader.java
+// copy from https://github.com/apache/iceberg/blob/apache-iceberg-1.11.0/core/src/main/java/org/apache/iceberg/ManifestReader.java
+// KEEP THIS TAG IN SYNC WITH ${iceberg.version} IN fe/pom.xml. This class shadows the one in
+// iceberg-core (identical FQN, and fe-core's classes precede the jar on the classpath), so if
+// upstream changes a constructor or method that iceberg-core itself calls, this copy still
+// compiles and then fails at RUNTIME with NoSuchMethodError. That is what happened on the
+// 1.10.0 -> 1.11.0 bump: ManifestFiles.read() started calling a 7-arg constructor that only
+// existed upstream.
 public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
         implements CloseableIterable<F> {
     static final ImmutableList<String> ALL_COLUMNS = ImmutableList.of("*");
@@ -85,6 +93,7 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
     private final InputFile file;
     private final InheritableMetadata inheritableMetadata;
     private final Long firstRowId;
+    private final boolean isCommitted;
     private final FileType content;
     private final PartitionSpec spec;
     private final Schema fileSchema;
@@ -105,6 +114,16 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
     private Cache<String, Set<DataFile>> dataFileCache;
     private Cache<String, Set<DeleteFile>> deleteFileCache;
     private Set<Integer> identifierFieldIds = null;
+    // statistics are cached column by column (ManifestColumnStats), keeping identifierFieldIds plus other columns up
+    // to this many in total
+    private int cacheStatsColumnLimit = 0;
+    // columns other than identifierFieldIds that may be kept in the column-wise layout, lower rank first; null for
+    // any column ranked by field id
+    private Map<Integer, Long> cacheStatsCandidateRanks = null;
+    // STRING and BINARY columns, whose long bounds the column-wise layout truncates
+    private Map<Integer, Type.TypeID> cacheStatsTruncatedTypes = null;
+    // live data files of the manifest when known (0 = unknown), so the column-wise arrays are sized once
+    private int cacheStatsExpectedFileCount = 0;
 
     protected ManifestReader(
             InputFile file,
@@ -122,12 +141,28 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
             InheritableMetadata inheritableMetadata,
             Long firstRowId,
             FileType content) {
+        this(file, specId, specsById, inheritableMetadata, firstRowId, true, content);
+    }
+
+    // Iceberg 1.11.0 added the isCommitted parameter and ManifestFiles.read() calls THIS
+    // overload. Because this class shadows the one in iceberg-core (same FQN, and fe-core's
+    // classes come first on the classpath), omitting it made iceberg-core's own
+    // ManifestFiles.read() fail with NoSuchMethodError at runtime while still compiling.
+    protected ManifestReader(
+            InputFile file,
+            int specId,
+            Map<Integer, PartitionSpec> specsById,
+            InheritableMetadata inheritableMetadata,
+            Long firstRowId,
+            boolean isCommitted,
+            FileType content) {
         Preconditions.checkArgument(
                 firstRowId == null || content == FileType.DATA_FILES,
                 "First row ID is not valid for delete manifests");
         this.file = file;
         this.inheritableMetadata = inheritableMetadata;
         this.firstRowId = firstRowId;
+        this.isCommitted = isCommitted;
         this.content = content;
 
         if (specsById != null) {
@@ -247,6 +282,26 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
         return this;
     }
 
+    ManifestReader<F> cacheStatsColumnLimit(int cacheStatsColumnLimit) {
+        this.cacheStatsColumnLimit = cacheStatsColumnLimit;
+        return this;
+    }
+
+    ManifestReader<F> cacheStatsCandidateRanks(Map<Integer, Long> cacheStatsCandidateRanks) {
+        this.cacheStatsCandidateRanks = cacheStatsCandidateRanks;
+        return this;
+    }
+
+    ManifestReader<F> cacheStatsTruncatedTypes(Map<Integer, Type.TypeID> cacheStatsTruncatedTypes) {
+        this.cacheStatsTruncatedTypes = cacheStatsTruncatedTypes;
+        return this;
+    }
+
+    ManifestReader<F> cacheStatsExpectedFileCount(int cacheStatsExpectedFileCount) {
+        this.cacheStatsExpectedFileCount = cacheStatsExpectedFileCount;
+        return this;
+    }
+
     CloseableIterable<ManifestEntry<F>> entries() {
         return entries(false /* all entries */);
     }
@@ -285,7 +340,8 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
         }
     }
 
-    // when the identifier field ids is null, it will copy all metrics.
+    // With metrics, the statistics of identifierFieldIds plus other columns up to cacheStatsColumnLimit are cached
+    // column by column; without, the files are cached without statistics.
     private CloseableIterable<ManifestEntry<F>> fillCacheIfNeeded(
             CloseableIterable<ManifestEntry<F>> entries, boolean shouldCacheDataFiles, boolean shouldCacheDeleteFiles) {
         if (!shouldCacheDataFiles && !shouldCacheDeleteFiles) {
@@ -296,17 +352,25 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
         // while missing a file, letting an incomplete entry pass the read-side size check.
         Set<DataFile> tmpDataFiles = ConcurrentHashMap.newKeySet();
         Set<DeleteFile> tmpDeleteFiles = ConcurrentHashMap.newKeySet();
-        if (shouldCacheDataFiles) {
-            final Set<Integer> requestedColumnIds =
-                    identifierFieldIds != null && !identifierFieldIds.isEmpty() ? identifierFieldIds : null;
+        // Compact statistics: copies without statistics are wrapped once the whole manifest has been read.
+        final ManifestColumnStats.Builder statsBuilder = shouldCacheDataFiles && dataFileCacheWithMetrics ?
+                ManifestColumnStats.builder(identifierFieldIds, cacheStatsCandidateRanks, cacheStatsColumnLimit,
+                        cacheStatsExpectedFileCount, cacheStatsTruncatedTypes) : null;
+        Map<Integer, DataFile> tmpStatslessDataFiles = new ConcurrentHashMap<>();
+        if (statsBuilder != null) {
             entries = CloseableIterable.transform(entries,
                     entry -> {
                         if (entry.isLive()) {
                             DataFile dataFile = (DataFile) entry.file();
-                            DataFile copiedDataFile = dataFileCacheWithMetrics ?
-                                    dataFile.copyWithStats(requestedColumnIds) :
-                                    dataFile.copyWithoutStats();
-                            tmpDataFiles.add(DataFileWrapper.wrap(copiedDataFile));
+                            tmpStatslessDataFiles.put(statsBuilder.add(dataFile), dataFile.copyWithoutStats());
+                        }
+                        return entry;
+                    });
+        } else if (shouldCacheDataFiles) {
+            entries = CloseableIterable.transform(entries,
+                    entry -> {
+                        if (entry.isLive()) {
+                            tmpDataFiles.add(DataFileWrapper.wrap(((DataFile) entry.file()).copyWithoutStats()));
                         }
                         return entry;
                     });
@@ -354,6 +418,11 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
             public void close() throws IOException {
                 try {
                     if (fullyConsumed.get()) {
+                        if (statsBuilder != null && !tmpStatslessDataFiles.isEmpty()) {
+                            ManifestColumnStats columnStats = statsBuilder.build();
+                            tmpStatslessDataFiles.forEach((index, dataFile) ->
+                                    tmpDataFiles.add(DataFileWrapper.wrap(dataFile, columnStats, index)));
+                        }
                         if (!tmpDataFiles.isEmpty()) {
                             dataFileCache.put(file.location(), tmpDataFiles); // to recalculate the weight
                         }
@@ -380,7 +449,12 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
     private Collection<String> withStatsColumnsForDataFileCache(
             Collection<String> projectColumns, boolean shouldCacheDataFiles) {
         if (shouldCacheDataFiles && dataFileCacheWithMetrics && projectColumns != null) {
-            return withStatsColumns(projectColumns);
+            List<String> withStats = withStatsColumns(projectColumns);
+            // the column sizes are cached too (the column statistics estimate row width from them)
+            if (!withStats.containsAll(ALL_COLUMNS)) {
+                withStats.add("column_sizes");
+            }
+            return withStats;
         }
         return projectColumns;
     }
@@ -426,7 +500,7 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
 
         CloseableIterable<ManifestEntry<F>> withMetadata =
                 CloseableIterable.transform(reader, inheritableMetadata::apply);
-        return CloseableIterable.transform(withMetadata, idAssigner(firstRowId));
+        return CloseableIterable.transform(withMetadata, idAssigner(firstRowId, isCommitted));
     }
 
     CloseableIterable<ManifestEntry<F>> liveEntries() {
@@ -516,7 +590,7 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
     }
 
     private static <F extends ContentFile<F>> Function<ManifestEntry<F>, ManifestEntry<F>> idAssigner(
-            Long firstRowId) {
+            Long firstRowId, boolean isCommitted) {
         if (firstRowId != null) {
             return new Function<>() {
                 private long nextRowId = firstRowId;
@@ -534,7 +608,13 @@ public class ManifestReader<F extends ContentFile<F>> extends CloseableGroup
                     return entry;
                 }
             };
+        } else if (!isCommitted) {
+            // Preserve firstRowId for entries in uncommitted manifests, including EXISTING entries
+            // that may be merged later. Without this branch an uncommitted manifest would have its
+            // row IDs nulled out below and row lineage would be lost on merge.
+            return Function.identity();
         } else {
+            // committed manifest with a null manifest-level firstRowId (pre-v3 upgrade path):
             // data file's first_row_id is null when the manifest's first_row_id is null
             return entry -> {
                 if (entry.file() instanceof BaseFile) {

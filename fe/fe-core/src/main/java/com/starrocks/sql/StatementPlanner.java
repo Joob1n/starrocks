@@ -23,6 +23,7 @@ import com.google.common.collect.Sets;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.ExternalOlapTable;
 import com.starrocks.catalog.OlapTable;
+import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.ResourceGroupClassifier;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.TableName;
@@ -46,6 +47,7 @@ import com.starrocks.service.FrontendOptions;
 import com.starrocks.sql.analyzer.Analyzer;
 import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.analyzer.Field;
 import com.starrocks.sql.analyzer.InsertAnalyzer;
 import com.starrocks.sql.analyzer.InsertSourceRefresher;
 import com.starrocks.sql.analyzer.PipeAnalyzer;
@@ -86,6 +88,7 @@ import com.starrocks.sql.optimizer.transformer.RelationTransformer;
 import com.starrocks.sql.optimizer.transformer.TransformerContext;
 import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.sql.plan.PlanFragmentBuilder;
+import com.starrocks.sql.plan.RangeScanExecutionValidator;
 import com.starrocks.sql.spm.SPMPlanner;
 import com.starrocks.thrift.TAuthenticateParams;
 import com.starrocks.thrift.TResultSinkType;
@@ -95,6 +98,7 @@ import com.starrocks.transaction.GlobalTransactionMgr;
 import com.starrocks.transaction.RemoteTransactionMgr;
 import com.starrocks.transaction.RunningTxnExceedException;
 import com.starrocks.transaction.TransactionState;
+import com.starrocks.type.PrimitiveType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -144,6 +148,7 @@ public class StatementPlanner {
             plannerMetaLocker = new PlannerMetaLocker(session, stmt);
             // Analyze
             analyzeStatement(stmt, session, plannerMetaLocker);
+            RangeScanExecutionValidator.validateStatement(stmt, session);
 
             // Whether planning will run off private snapshots is decided here, before the authorization
             // check, and when it will the snapshots are taken and the lock dropped first. The check is not
@@ -340,9 +345,24 @@ public class StatementPlanner {
                 refreshRemainingInsertSources(statement, session);
                 takeLock.run();
                 Analyzer.analyze(statement, session);
+                checkQueryOutput(statement);
                 refreshRemainingInsertSources(statement, session);
                 ExplicitTxnStatementValidator.validate(statement, session);
                 return false;
+            }
+        }
+    }
+
+    private static void checkQueryOutput(StatementBase statement) {
+        if (statement instanceof QueryStatement query && !query.hasOutFileClause()) {
+            if (query.isExplain() && !query.isExplainAnalyze()) {
+                return;
+            }
+            for (Field field : query.getQueryRelation().getRelationFields().getAllFields()) {
+                if (field.getType().isScalarType(PrimitiveType.GEOMETRY)) {
+                    throw new SemanticException(
+                            "GEOMETRY query results are not supported; use ST_AsText or ST_AsBinary", query.getPos());
+                }
             }
         }
     }
@@ -476,8 +496,29 @@ public class StatementPlanner {
                         + "was being planned, please retry", ErrorType.INTERNAL_ERROR);
             }
             AnalyzerUtils.copyOlapTable(stmt, copies);
+            resetAllTargetPartitionIds(stmt);
         }
         return copies;
+    }
+
+    /**
+     * An INSERT into every partition of an olap table took their ids at analysis, under the lock {@link
+     * #copyOlapTablesAndUnlock} dropped before taking the whole set again. A partition dropped or replaced in between
+     * would fail the sink with an unknown partition, so take them again, under the lock now held. Partitions the
+     * statement names are left alone: one gone since is an error.
+     */
+    private static void resetAllTargetPartitionIds(StatementBase stmt) {
+        if (!(stmt instanceof InsertStmt insertStmt) || !(insertStmt.getTargetTable() instanceof OlapTable target)
+                || insertStmt.isSpecifyPartitionNames() || insertStmt.isStaticKeyPartitionInsert()
+                || insertStmt.isDynamicOverwrite()) {
+            return;
+        }
+        List<Long> targetPartitionIds = target.getPartitions().stream().map(Partition::getId).toList();
+        if (targetPartitionIds.isEmpty()) {
+            throw new SemanticException("data cannot be inserted into table with empty partition." +
+                    "Use `SHOW PARTITIONS FROM %s` to see the currently partitions of this table. ", target.getName());
+        }
+        insertStmt.setTargetPartitionIds(Lists.newArrayList(targetPartitionIds));
     }
 
     /** The table a writing statement writes into, or null for anything else. */
@@ -643,6 +684,7 @@ public class StatementPlanner {
              * currently only used in Spark/Flink Connector
              * Because the connector sends only simple queries, it only needs to remove the output fragment
              */
+            RangeScanExecutionValidator.validatePhysicalPlan(optimizedPlan, queryStmt, session);
             ExecPlan execPlan = PlanFragmentBuilder.createPhysicalPlan(
                     optimizedPlan, session, logicalPlan.getOutputColumn(), columnRefFactory, colNames,
                     resultSinkType,
@@ -733,6 +775,7 @@ public class StatementPlanner {
                     // SingleNodeExecPlan is set in TableQueryPlanAction to generate a single-node Plan,
                     // currently only used in Spark/Flink Connector
                     // Because the connector sends only simple queries, it only needs to remove the output fragment
+                    RangeScanExecutionValidator.validatePhysicalPlan(optimizedPlan, queryStmt, session);
                     ExecPlan plan = PlanFragmentBuilder.createPhysicalPlan(
                             optimizedPlan, session, logicalPlan.getOutputColumn(), columnRefFactory, colNames,
                             resultSinkType,
@@ -1006,7 +1049,8 @@ public class StatementPlanner {
         stmt.setTxnId(txnId);
     }
 
-    private static void abortTransaction(DmlStmt stmt, ConnectContext session, String errMsg) {
+    /** Aborts the transaction {@link #beginTransaction} opened for stmt, if it opened one. */
+    public static void abortTransaction(DmlStmt stmt, ConnectContext session, String errMsg) {
         long txnId = stmt.getTxnId();
         if (txnId == DmlStmt.INVALID_TXN_ID) {
             return;
