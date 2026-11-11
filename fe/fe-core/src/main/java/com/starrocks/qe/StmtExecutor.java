@@ -3671,7 +3671,7 @@ public class StmtExecutor {
         }
 
         if (dmlType == DmlType.INSERT_OVERWRITE && !((InsertStmt) parsedStmt).hasOverwriteJob() &&
-                !(targetTable.isIcebergTable() || targetTable.isHiveTable())) {
+                !(targetTable.isIcebergTable() || targetTable.isHiveTable() || targetTable.isPaimonTable())) {
             handleInsertOverwrite(execPlan, (InsertStmt) parsedStmt);
             return;
         }
