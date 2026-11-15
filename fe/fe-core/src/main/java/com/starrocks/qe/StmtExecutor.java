@@ -4335,6 +4335,11 @@ public class StmtExecutor {
     }
 
     public void executeStmtWithResultQueue(ConnectContext context, ExecPlan plan, Queue<TResultBatch> sqlResult) {
+        executeStmtWithResultConsumer(context, plan, sqlResult::add);
+    }
+
+    public void executeStmtWithResultConsumer(ConnectContext context, ExecPlan plan,
+                                              java.util.function.Consumer<TResultBatch> consumer) {
         coord = null;
         try {
             UUID uuid = context.getQueryId();
@@ -4347,6 +4352,9 @@ public class StmtExecutor {
             QeProcessorImpl.INSTANCE.registerQuery(context.getExecutionId(),
                     new QeProcessorImpl.QueryInfo(context, getRedactedOriginStmtInString(), coord));
 
+            if (context.isStatementCancelled()) {
+                throw new StarRocksException("Metadata collection cancelled");
+            }
             coord.exec();
             RowBatch batch;
             do {
@@ -4357,7 +4365,7 @@ public class StmtExecutor {
                 }
 
                 if (batch.getBatch() != null) {
-                    sqlResult.add(batch.getBatch());
+                    consumer.accept(batch.getBatch());
                 }
             } while (!batch.isEos());
             context.getState().setEof();
@@ -4368,6 +4376,7 @@ public class StmtExecutor {
                 context.getState().setError(e.getMessage());
             }
             if (coord != null) {
+                coord.cancel("Metadata collection failed: " + e.getMessage());
                 coord.getExecStatus().setInternalErrorStatus(e.getMessage());
             }
         } finally {
